@@ -1,4 +1,5 @@
 import json
+import ctypes
 import math
 import os
 import time
@@ -6,6 +7,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Optional, Tuple
 from pathlib import Path
 
+import fused_ssim
+from torch.amp import autocast
+import fused_ssim_cuda
+
+from multiprocessing import Value as SMValue
+import cv2
 import imageio
 import nerfview
 import numpy as np
@@ -18,7 +25,7 @@ from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure, TotalVariation
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from utils import (
     AppearanceOptModule,
@@ -31,21 +38,25 @@ from utils import (
 )
 from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
 from gsplat.rendering import rasterization_2dgs, rasterization_2dgs_inria_wrapper
-from gsplat.strategy import DefaultStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
 @dataclass
 class Config:
+    refine_mcmc_cap_max: int = 300_000
+    refine_strategy: Literal["mcmc", "default"] = "mcmc"
     # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt file. If provide, it will skip training and render a video
     ckpt: Optional[str] = None
-
+    radius_clip: float = 0.0
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # increase data factor at these iterations until we are at 1
+    data_factor_up_steps = [10_000, 24_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -68,9 +79,9 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 15_000, 24_000,30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [7_000, 15_000,24_000,30_000])
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -83,7 +94,7 @@ class Config:
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
-    init_opa: float = 0.1
+    init_opa: float = 0.5
     # Initial scale of GS
     init_scale: float = 1.0
     # Weight for SSIM loss
@@ -95,13 +106,13 @@ class Config:
     far_plane: float = 200
 
     # GSs with opacity below this value will be pruned
-    prune_opa: float = 0.05
+    prune_opa: float = 0.2
     # GSs with image plane gradient above this value will be split/duplicated
-    grow_grad2d: float = 0.0002
+    grow_grad2d: float = 0.0001
     # GSs with scale below this value will be duplicated. Above will be split
-    grow_scale3d: float = 0.01
+    grow_scale3d: float = 0.005
     # GSs with scale above this value will be pruned.
-    prune_scale3d: float = 0.1
+    prune_scale3d: float = 0.10
 
     # Start refining GSs after this iteration
     refine_start_iter: int = 500
@@ -124,10 +135,10 @@ class Config:
     revised_opacity: bool = False
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = False
+    random_bkgd: bool = True
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -150,14 +161,14 @@ class Config:
     depth_lambda: float = 1e-2
 
     # Enable normal consistency loss. (Currently for 2DGS only)
-    normal_loss: bool = False
+    normal_loss: bool = True
     # Weight for normal loss
     normal_lambda: float = 5e-2
     # Iteration to start normal consistency regulerization
     normal_start_iter: int = 7_000
 
     # Distortion loss. (experimental)
-    dist_loss: bool = False
+    dist_loss: bool = True
     # Weight for distortion loss
     dist_lambda: float = 1e-2
     # Iteration to start distortion loss regulerization
@@ -176,10 +187,18 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
-        self.refine_start_iter = int(self.refine_start_iter * factor)
-        self.refine_stop_iter = int(self.refine_stop_iter * factor)
-        self.reset_every = int(self.reset_every * factor)
-        self.refine_every = int(self.refine_every * factor)
+        if self.refine_strategy.lower() == "default":
+            self.refine_start_iter = int(self.refine_start_iter * factor)
+            self.refine_stop_iter = int(self.refine_stop_iter * factor)
+            self.reset_every = int(self.reset_every * factor)
+            self.refine_every = int(self.refine_every * factor)
+        elif self.refine_strategy.lower() == "mcmc":
+            self.refine_start_iter = int(self.refine_start_iter * factor)
+            self.refine_stop_iter = int(self.refine_stop_iter * factor)
+            self.refine_every = int(self.refine_every * factor)
+        else:
+            assert False, "Unknown strategy" + self.refine_strategy
+
 
 
 def create_splats_with_optimizers(
@@ -239,11 +258,17 @@ def create_splats_with_optimizers(
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
+
+    def make_optimizer(p, sparse_grad, **kwargs):
+        eps = eps=1e-15/math.sqrt(batch_size)
+        betas = (1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999))
+        if sparse_grad: return torch.optim.SparseAdam(p, eps=eps, betas=betas)
+        return torch.optim.AdamW(p, eps=eps, betas=betas, fused=True, weight_decay=0)
+
     optimizers = {
-        name: (torch.optim.SparseAdam if sparse_grad else torch.optim.Adam)(
+        name: make_optimizer(
             [{"params": splats[name], "lr": lr * math.sqrt(batch_size)}],
-            eps=1e-15 / math.sqrt(batch_size),
-            betas=(1 - batch_size * (1 - 0.9), 1 - batch_size * (1 - 0.999)),
+            sparse_grad=sparse_grad
         )
         for name, _, lr in params
     }
@@ -280,11 +305,16 @@ class Runner:
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
+
+
+        self.shared_factor = SMValue(ctypes.c_int, cfg.data_factor)
+
         self.trainset = Dataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            shared_factor=self.shared_factor
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -330,6 +360,32 @@ class Runner:
             revised_opacity=cfg.revised_opacity,
             key_for_gradient=key_for_gradient,
         )
+
+        if cfg.refine_strategy.lower() == "mcmc":
+            self.strategy = MCMCStrategy(
+                verbose=True,
+                cap_max=cfg.refine_mcmc_cap_max, refine_start_iter=cfg.refine_start_iter,refine_stop_iter=cfg.refine_stop_iter,refine_every=cfg.refine_every, min_opacity=cfg.prune_opa
+        )
+        elif cfg.refine_strategy.lower() == "default":
+            self.strategy = DefaultStrategy(
+                verbose=True,
+                prune_opa=cfg.prune_opa,
+                grow_grad2d=cfg.grow_grad2d,
+                grow_scale3d=cfg.grow_scale3d,
+                prune_scale3d=cfg.prune_scale3d,
+                # refine_scale2d_stop_iter=4000, # splatfacto behavior
+                refine_start_iter=cfg.refine_start_iter,
+                refine_stop_iter=cfg.refine_stop_iter,
+                reset_every=cfg.reset_every,
+                refine_every=cfg.refine_every,
+                absgrad=cfg.absgrad,
+                revised_opacity=cfg.revised_opacity,
+                key_for_gradient=key_for_gradient,
+            )
+        else:
+            assert False, "Unknown strategy: " + cfg.refine_strategy
+
+
         self.strategy.check_sanity(self.splats, self.optimizers)
         self.strategy_state = self.strategy.initialize_state()
 
@@ -369,9 +425,65 @@ class Runner:
                 ),
             ]
 
+        def maskedPSNR(x,y,mask, max_ = 1.0):
+            if mask is None:
+                mask = torch.ones_like(x).float()
+            l2 = ((x-y)*mask.permute(0,3,1,2).repeat(1,3,1,1))**2
+            mse = l2.mean()
+            psnr = 10 * torch.log10((max_**2)/mse)
+            return psnr
+
         # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        self.psnr = maskedPSNR
+
+        def sobel_filter(img):
+            # Convert to (B, C, H, W)
+            img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            B, C, H, W = img.shape
+            device = img.device
+            dtype = img.dtype
+
+            # Define Sobel kernels
+            sobel_x = torch.tensor([[-1, 0, 1],
+                                    [-2, 0, 2],
+                                    [-1, 0, 1]], dtype=dtype, device=device) / 8.0
+
+            sobel_y = torch.tensor([[-1, -2, -1],
+                                    [ 0,  0,  0],
+                                    [ 1,  2,  1]], dtype=dtype, device=device) / 8.0
+
+            # Reshape to (1, 1, 3, 3)
+            sobel_x = sobel_x.view(1, 1, 3, 3)
+            sobel_y = sobel_y.view(1, 1, 3, 3)
+
+            # Expand to (C, 1, 3, 3) for depthwise conv
+            sobel_x = sobel_x.expand(C, 1, 3, 3)
+            sobel_y = sobel_y.expand(C, 1, 3, 3)
+
+            # Depthwise convolution
+            grad_x = F.conv2d(img, sobel_x, padding=1, groups=C)
+            grad_y = F.conv2d(img, sobel_y, padding=1, groups=C)
+
+            # Return in original NHWC format
+            return grad_x.permute(0, 2, 3, 1), grad_y.permute(0, 2, 3, 1)
+
+
+        def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
+            dx, dy = sobel_filter(img)
+            if norm == "l1": tv = torch.abs(dx) + torch.abs(dy)
+            elif norm == "l2": tv = (dx * dx + dy * dy)
+            else: assert False, "Unknown norm"
+
+            if reduction == 'mean':
+                return tv.mean()
+            elif reduction == 'sum':
+                return tv.sum()
+            else:
+                return tv
+            
+        self.tvloss = tv_loss_sobel
+
+
         self.lpips = LearnedPerceptualImagePatchSimilarity(normalize=True).to(
             self.device
         )
@@ -431,7 +543,7 @@ class Runner:
                 scales=scales,
                 opacities=opacities,
                 colors=colors,
-                viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+                viewmats = torch.linalg.inv(camtoworlds.to(dtype=torch.float32)).to(dtype=means.dtype),
                 Ks=Ks,  # [C, 3, 3]
                 width=width,
                 height=height,
@@ -517,15 +629,22 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+
+            while True:
+                expected_factor = self.shared_factor.value
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
+                if data["factor"] == expected_factor: break
+            
+
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            fgmask = data["fgmask"].to(device)
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -563,8 +682,9 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
+                render_mode="RGB+D",
                 distloss=self.cfg.dist_loss,
+                radius_clip=self.cfg.radius_clip,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -583,16 +703,62 @@ class Runner:
                 info=info,
             )
             masks = data["mask"].to(device) if "mask" in data else None
-            if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
+            if masks is not None: total_mask = masks[...,None] * fgmask.bool()
+            else: total_mask = fgmask.bool()
+            
+            invmask = ~total_mask
+
+            disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+            invalid_depth = disp.abs() * invmask
+            invalid_alpha  = alphas.abs() * invmask
+
+            invalid = invalid_depth + invalid_alpha
+
+            assert invalid.shape[-1] == 1, "Invalid must be a single channel mask"
+            invalidpixels_sum = invmask.sum()
+
 
             # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - self.ssim(
-                pixels.permute(0, 3, 1, 2), colors.permute(0, 3, 1, 2)
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss_scale_factor = 1/((np.prod(invmask.shape)-invalidpixels_sum) / np.prod(invmask.shape) + 1e-8)
+
+            aloss = invalid.mean() * loss_scale_factor
+
+
+
+            #tvloss_color = 0;#self.tvloss(colors, "l1", reduction=None).mean(dim=-1,keepdim=True).mean()
+            #tvloss_depth = self.tvloss(disp * (1-fgmask), "l2", reduction=None).sum(dim=-1,keepdim=True).sum() * (1/((1-fgmask).sum()+1e-8))
+            tvloss_alpha = self.tvloss(alphas * (1-fgmask), "l2", reduction=None).sum(dim=-1,keepdim=True).mean()
+
+
+            pixels = pixels * total_mask
+            colors = colors * total_mask
+            l1loss = F.l1_loss(colors, pixels) * loss_scale_factor
+            ssimloss = (1.0 - fused_ssim.fused_ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+            )) * loss_scale_factor
+
+
+            #lpips_loss = self.lpips((colors.clip(0,1).permute(0,3,1,2)), (pixels.permute(0,3,1,2)))
+            #loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + 0.05 * aloss + 0.2 * (tvloss_color + 100 * tvloss_depth)
+
+
+            dfloss_alpha = ((alphas - fgmask)**2 * (1-fgmask)).sum() 
+
+            #start at l0, decrease to l1, find a
+            # l1 = l0 * exp(a*(step-500))
+            # ln(l1) = ln(l0) + a *(max_steps-500)
+            # ln(l1)-ln(l0)/(max_steps-500)
+            def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
+                if last_step is not None and last_step < step: return 0
+                if first_step > step: return 0
+                exp_scale_factor = (math.log(lamda1)-math.log(lamda0))/(max_steps-first_step)
+                step = min(step, max_steps)
+                return lamda0 * math.exp(exp_scale_factor * (step-first_step))
+
+
+
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100 * tvloss_alpha) / (np.prod(fgmask.shape) - fgmask.sum())
+            #loss = (1.4 * ssimloss + tvloss_color + (dfloss_alpha + tvloss_alpha)) + 0.3 * tvloss_depth
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -636,7 +802,16 @@ class Runner:
                 distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
 
-            loss.backward()
+            with torch.autograd.profiler.profile(use_cuda=True) as prof:
+                start_train_time = time.perf_counter_ns()
+                loss.backward(retain_graph=False)
+                end_train_time = time.perf_counter_ns()
+
+            if step % 100 == 0:
+                #print(f"Time in milliseconds: {(end_train_time-start_train_time) * 1e-6:.2f} ms", end="\n\t")
+                #print(prof.key_averages().table(sort_by="cuda_time_total"), end="\n\t")
+                #print()
+                pass
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
@@ -672,14 +847,19 @@ class Runner:
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
-
+            
+            strategy_kwargs = {
+                "lr":schedulers[0].get_last_lr()[0],
+            } if cfg.refine_strategy == "mcmc" else {
+                "packed": cfg.packed
+                }
             self.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
                 state=self.strategy_state,
                 step=step,
                 info=info,
-                packed=cfg.packed,
+                **strategy_kwargs
             )
 
             # Turn Gradients into Sparse Tensor before running optimizer
@@ -746,6 +926,8 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+            if step in [i-1 for i in cfg.data_factor_up_steps]:
+                self.shared_factor.value = max(self.shared_factor.value-1, 1)
 
     @torch.no_grad()
     def eval(self, step: int):
@@ -763,6 +945,12 @@ class Runner:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
+            fgmask = data["fgmask"].to(device)
+            if "mask" in data:
+                mask = fgmask * data["mask"][...,None].to(device).bool()
+            else: mask = fgmask
+            loss_scale_factor = 1/((mask.sum()) / np.prod(mask.shape) + 1e-8)
+
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
@@ -792,7 +980,7 @@ class Runner:
 
             # write images
             canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
-            imageio.imwrite(
+            cv2.imwrite(
                 f"{self.render_dir}/val_{i:04d}.png", (canvas * 255).astype(np.uint8)
             )
 
@@ -805,7 +993,7 @@ class Runner:
                 apply_float_colormap(render_median).detach().cpu().squeeze(0).numpy()
             )
 
-            imageio.imwrite(
+            cv2.imwrite(
                 f"{self.render_dir}/val_{i:04d}_median_depth_{step}.png",
                 (render_median * 255).astype(np.uint8),
             )
@@ -813,7 +1001,7 @@ class Runner:
             # write normals
             normals = (normals * 0.5 + 0.5).squeeze(0).cpu().numpy()
             normals_output = (normals * 255).astype(np.uint8)
-            imageio.imwrite(
+            cv2.imwrite(
                 f"{self.render_dir}/val_{i:04d}_normal_{step}.png", normals_output
             )
 
@@ -826,7 +1014,7 @@ class Runner:
             normals_from_depth_output = (normals_from_depth * 255).astype(np.uint8)
             if len(normals_from_depth_output.shape) == 4:
                 normals_from_depth_output = normals_from_depth_output.squeeze(0)
-            imageio.imwrite(
+            cv2.imwrite(
                 f"{self.render_dir}/val_{i:04d}_normals_from_depth_{step}.png",
                 normals_from_depth_output,
             )
@@ -840,15 +1028,20 @@ class Runner:
             render_dist = (
                 apply_float_colormap(render_dist).detach().cpu().squeeze(0).numpy()
             )
-            imageio.imwrite(
+            cv2.imwrite(
                 f"{self.render_dir}/val_{i:04d}_distortions_{step}.png",
                 (render_dist * 255).astype(np.uint8),
             )
 
+            colors = colors * mask
+            pixels = pixels * mask
+
             pixels = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
             colors = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-            metrics["psnr"].append(self.psnr(colors, pixels))
-            metrics["ssim"].append(self.ssim(colors, pixels))
+            metrics["psnr"].append(self.psnr(colors, pixels, fgmask))
+            metrics["ssim"].append(fused_ssim.fused_ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+            ))
             metrics["lpips"].append(self.lpips(colors, pixels))
 
         ellipse_time /= len(valloader)
@@ -897,41 +1090,44 @@ class Runner:
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
 
-        canvas_all = []
-        for i in tqdm.trange(len(camtoworlds), desc="Rendering trajectory"):
-            renders, _, _, surf_normals, _, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds[i : i + 1],
-                Ks=K[None],
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
-            )  # [1, H, W, 4]
-            colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
-            depths = renders[0, ..., 3:4]  # [H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
-
-            surf_normals = (surf_normals - surf_normals.min()) / (
-                surf_normals.max() - surf_normals.min()
-            )
-
-            # write images
-            canvas = torch.cat(
-                [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
-            )
-            canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
-            canvas_all.append(canvas)
-
-        # save to video
         video_dir = f"{cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
-        writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
-        for canvas in canvas_all:
-            writer.append_data(canvas)
-        writer.close()
-        print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        try:
+            steps = max(len(camtoworlds)//100, 1)
+
+            writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=max(30//steps, 1), macro_block_size=None)
+            for i in tqdm.trange(0,len(camtoworlds), steps, desc="Rendering trajectory"):
+                renders, _, _, surf_normals, _, _, _ = self.rasterize_splats(
+                    camtoworlds=camtoworlds[i : i + 1],
+                    Ks=K[None],
+                    width=width,
+                    height=height,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    render_mode="RGB+ED",
+                )  # [1, H, W, 4]
+                colors = torch.clamp(renders[0, ..., 0:3], 0.0, 1.0)  # [H, W, 3]
+                depths = renders[0, ..., 3:4]  # [H, W, 1]
+                depths = (depths - depths.min()) / (depths.max() - depths.min())
+
+                surf_normals = (surf_normals - surf_normals.min()) / (
+                    surf_normals.max() - surf_normals.min()
+                )
+
+                # write images
+                canvas = torch.cat(
+                    [colors, depths.repeat(1, 1, 3)], dim=0 if width > height else 1
+                )
+                canvas = (canvas.cpu().numpy() * 255).astype(np.uint8)
+                writer.append_data(canvas)
+
+            # save to video
+            writer.close()
+            print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        except Exception as e:
+            print("Error writing video: ", e)
+
 
     @torch.no_grad()
     def _viewer_render_fn(
@@ -976,7 +1172,7 @@ class Runner:
 
         if render_tab_state.render_mode == "depth":
             # normalize depth to [0, 1]
-            depth = render_median
+            depth = render_median[0,...]
             if render_tab_state.normalize_nearfar:
                 near_plane = render_tab_state.near_plane
                 far_plane = render_tab_state.far_plane
@@ -993,7 +1189,7 @@ class Runner:
                 .numpy()
             )
         elif render_tab_state.render_mode == "normal":
-            render_normals = render_normals * 0.5 + 0.5  # normalize to [0, 1]
+            render_normals = render_normals[0,...] * 0.5 + 0.5  # normalize to [0, 1]
             renders = render_normals.cpu().numpy()
         elif render_tab_state.render_mode == "alpha":
             alpha = render_alphas[0, ..., 0:1]
@@ -1017,7 +1213,8 @@ def main(cfg: Config):
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
     else:
-        runner.train()
+        with torch.amp.autocast(device_type="cuda"):
+            runner.train()
 
     if not cfg.disable_viewer:
         print("Viewer running... Ctrl+C to exit.")

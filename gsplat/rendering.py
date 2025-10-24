@@ -1209,6 +1209,7 @@ def rasterization_inria_wrapper(
             )
 
             raster_settings = GaussianRasterizationSettings(
+                antialiasing=False,
                 image_height=height,
                 image_width=width,
                 tanfovx=tanfovx,

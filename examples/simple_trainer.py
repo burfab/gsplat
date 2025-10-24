@@ -6,6 +6,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+import ctypes
+
+import fused_ssim
+from torch.amp import autocast
+import fused_ssim_cuda
+
+from multiprocessing import Value as SMValue
+import cv2
 
 import imageio
 import numpy as np
@@ -55,6 +63,8 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # increase data factor at these iterations until we are at 1
+    data_factor_up_steps = [5000, 15_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -83,7 +93,7 @@ class Config:
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
@@ -120,12 +130,12 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
-    visible_adam: bool = False
+    visible_adam: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = False
+    random_bkgd: bool = True
 
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -146,7 +156,7 @@ class Config:
     scale_reg: float = 0.0
 
     # Enable camera optimization.
-    pose_opt: bool = False
+    pose_opt: bool = True
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -330,10 +340,13 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
+        self.shared_factor = SMValue(ctypes.c_int, cfg.data_factor)
+
+
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
+            factor=self.shared_factor.value,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
         )
@@ -342,6 +355,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            shared_factor=self.shared_factor
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -454,8 +468,64 @@ class Runner:
             ]
 
         # Losses & Metrics.
-        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
+        def maskedPSNR(x,y,mask, max_ = 1.0):
+            if mask is None:
+                mask = torch.ones_like(x).float()
+            l2 = ((x-y)*mask.permute(0,3,1,2).repeat(1,3,1,1))**2
+            mse = l2.mean()
+            psnr = 10 * torch.log10((max_**2)/mse)
+            return psnr
+
+        # Losses & Metrics.
+        self.psnr = maskedPSNR
+
+        def sobel_filter(img):
+            # Convert to (B, C, H, W)
+            img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
+            B, C, H, W = img.shape
+            device = img.device
+            dtype = img.dtype
+
+            # Define Sobel kernels
+            sobel_x = torch.tensor([[-1, 0, 1],
+                                    [-2, 0, 2],
+                                    [-1, 0, 1]], dtype=dtype, device=device) / 8.0
+
+            sobel_y = torch.tensor([[-1, -2, -1],
+                                    [ 0,  0,  0],
+                                    [ 1,  2,  1]], dtype=dtype, device=device) / 8.0
+
+            # Reshape to (1, 1, 3, 3)
+            sobel_x = sobel_x.view(1, 1, 3, 3)
+            sobel_y = sobel_y.view(1, 1, 3, 3)
+
+            # Expand to (C, 1, 3, 3) for depthwise conv
+            sobel_x = sobel_x.expand(C, 1, 3, 3)
+            sobel_y = sobel_y.expand(C, 1, 3, 3)
+
+            # Depthwise convolution
+            grad_x = F.conv2d(img, sobel_x, padding=1, groups=C)
+            grad_y = F.conv2d(img, sobel_y, padding=1, groups=C)
+
+            # Return in original NHWC format
+            return grad_x.permute(0, 2, 3, 1), grad_y.permute(0, 2, 3, 1)
+
+
+        def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
+            dx, dy = sobel_filter(img)
+            if norm == "l1": tv = torch.abs(dx) + torch.abs(dy)
+            elif norm == "l2": tv = (dx * dx + dy * dy)
+            else: assert False, "Unknown norm"
+
+            if reduction == 'mean':
+                return tv.mean()
+            elif reduction == 'sum':
+                return tv.sum()
+            else:
+                return tv
+            
+        self.tvloss = tv_loss_sobel
+
 
         if cfg.lpips_net == "alex":
             self.lpips = LearnedPerceptualImagePatchSimilarity(
@@ -520,7 +590,7 @@ class Runner:
             scales=scales,
             opacities=opacities,
             colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
+            viewmats = torch.linalg.inv(camtoworlds.to(dtype=torch.float32)).to(dtype=means.dtype),
             Ks=Ks,  # [C, 3, 3]
             width=width,
             height=height,
@@ -606,20 +676,36 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            while True:
+                expected_factor = self.shared_factor.value
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
+                if data["factor"] == expected_factor: break
+            
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            camtoworlds_gt = data["camtoworld"].to(device)
+            camtoworlds    = camtoworlds_gt.clone()
+
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            fgmask = data["fgmask"].to(device).float()
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            masks = data["mask"].to(device).float() if "mask" in data else None  # [1, H, W]
+
+            total_mask = (masks * fgmask) if masks is not None else fgmask
+
+            
+            valid_px = total_mask.sum()
+            all_px   = total_mask.numel()
+            loss_scale_factor = all_px / (valid_px + 1e-8)
+
+
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
@@ -678,31 +764,49 @@ class Runner:
                 step=step,
                 info=info,
             )
+            
+            #pixels = pixels * total_mask
+            #colors = colors * total_mask
 
-            # loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            # compute photometric loss only on foreground
+            # === photometric on foreground only ===
+            l1loss   = F.l1_loss(colors[total_mask.bool().expand_as(colors)], 
+                                pixels[total_mask.bool().expand_as(pixels)])
+            ssimloss = (1.0 - fused_ssim(
+                (colors*total_mask).permute(0,3,1,2), 
+                (pixels*total_mask).permute(0,3,1,2)
+            )) * loss_scale_factor
+
+
+
+            def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
+                if last_step is not None and last_step < step: return 0
+                if first_step > step: return 0
+                exp_scale_factor = (math.log(lamda1)-math.log(lamda0))/(max_steps-first_step)
+                step = min(step, max_steps)
+                return lamda0 * math.exp(exp_scale_factor * (step-first_step))
+
+            bg = 1.0 - fgmask
+            dfloss_alpha = ((alphas - fgmask)**2 * bg).sum()
+            tvloss_alpha = self.tvloss(alphas * bg, "l2", reduction=None).sum(dim=-1, keepdim=True).mean()
+            den_bg = (bg.numel() - bg.sum()).clamp(min=1)
+            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
+
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + alpha_reg
+
+
+            #loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100 * tvloss_alpha) / (np.prod(fgmask.shape) - fgmask.sum())
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                # sample depths at points
+                pts = torch.stack([points[:,:,0]/(width-1)*2-1, points[:,:,1]/(height-1)*2-1], dim=-1)  # (B,M,2)
+                grid = pts.unsqueeze(2)   # (B,M,1,2)
+                sampled = F.grid_sample(depths.permute(0,3,1,2), grid, align_corners=True)  # (B,1,M,1)
+                depths_s = sampled.squeeze(3).squeeze(1)  # (B,M)
+                valid_d  = depths_s > 0
+                disp     = torch.zeros_like(depths_s)
+                disp[valid_d] = 1.0 / depths_s[valid_d]
+                disp_gt  = 1.0 / depths_gt
+                depthloss = F.l1_loss(disp[valid_d], disp_gt[valid_d]) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -891,10 +995,14 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
                 self.render_traj(step)
-
+            
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
+            
+            if step in [i-1 for i in cfg.data_factor_up_steps]:
+                self.shared_factor.value = max(self.shared_factor.value-1, 1)
+
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -930,6 +1038,13 @@ class Runner:
             masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
 
+            fgmask = data["fgmask"].to(device)
+            if "mask" in data:
+                mask = fgmask * data["mask"][...,None].to(device).bool()
+            else: mask = fgmask
+            loss_scale_factor = 1/((mask.sum()) / np.prod(mask.shape) + 1e-8)
+
+
             torch.cuda.synchronize()
             tic = time.time()
             colors, _, _ = self.rasterize_splats(
@@ -956,17 +1071,20 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+                
+                colors = colors * mask
+                pixels = pixels * mask
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
+                metrics["psnr"].append(self.psnr(colors_p, pixels_p, fgmask))
+                metrics["ssim"].append(fused_ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                     metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
+                    metrics["cc_ssim"].append(fused_ssim(cc_colors_p, pixels_p))
                     metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
 
         if world_rank == 0:
