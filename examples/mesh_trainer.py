@@ -67,11 +67,11 @@ class Config:
     # Downsample factor for the dataset
     data_factor: int = 4
     # increase data factor at these iterations until we are at 1
-    data_factor_up_steps = [5000, 15_000]
+    data_factor_up_steps = [2000, 5_000, 15_000, 24_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 8
+    test_every: int = 100
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -86,13 +86,11 @@ class Config:
 
     # Batch size for training. Learning rates are scaled automatically
     batch_size: int = 1
-    # A global factor to scale the number of training steps
-    steps_scaler: float = 1.0
 
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 32_000])
+    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -115,9 +113,9 @@ class Config:
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
-    init_opa: float = 0.1
+    init_opa: float = 0.5
     # Initial scale of GS
-    init_scale: float = 1.0
+    init_scale: float = 0.1
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
 
@@ -131,9 +129,9 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
-    visible_adam: bool = False
+    visible_adam: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = True
+    antialiased: bool = False
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = True
@@ -152,9 +150,9 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
 
     # Opacity regularization
-    opacity_reg: float = 0.0
+    opacity_reg: float = 0.01
     # Scale regularization
-    scale_reg: float = 0.0
+    scale_reg: float = 0.01
 
     # Enable camera optimization.
     pose_opt: bool = True
@@ -198,26 +196,6 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    def adjust_steps(self, factor: float, strategies):
-        self.eval_steps = [int(i * factor) for i in self.eval_steps]
-        self.save_steps = [int(i * factor) for i in self.save_steps]
-        self.ply_steps = [int(i * factor) for i in self.ply_steps]
-        self.max_steps = int(self.max_steps * factor)
-        self.sh_degree_interval = int(self.sh_degree_interval * factor)
-
-        for strategy in strategies:
-            if strategy is None: continue
-            if isinstance(strategy, DefaultStrategy):
-                strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-                strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-                strategy.reset_every = int(strategy.reset_every * factor)
-                strategy.refine_every = int(strategy.refine_every * factor)
-            elif isinstance(strategy, MCMCStrategy):
-                strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
-                strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
-                strategy.refine_every = int(strategy.refine_every * factor)
-            else:
-                assert_never(strategy)
 
 import open3d as o3d
 
@@ -239,7 +217,7 @@ def create_splats(
     if init_type == "mesh":
         if mesh_path is None or len(mesh_path) == 0: assert False, "Mesh path may not be None or empty"
         mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        return splats.create_surface_splats_from_mesh(mesh_o3d, 2, sh_degree, init_opacity, init_scale, device)
+        return splats.create_surface_splats_from_mesh(mesh_o3d, 4, sh_degree, init_opacity, init_scale, device)
     elif init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -261,6 +239,8 @@ def create_splats(
     scales = scales[world_rank::world_size]
 
     return splats.create_free_splats_from_points(points, rgbs, sh_degree, init_opacity, init_scale, feature_dim, device)
+
+from collections import OrderedDict
 
 
 class Runner:
@@ -317,8 +297,6 @@ class Runner:
         # Model
         feature_dim = 32 if cfg.app_opt else None
         self.splats_dict = {}
-        self.optimizers_dict = {}
-        """
         self.splats_dict["free"] = create_splats(
             self.parser,
             init_type=cfg.init_type,
@@ -333,7 +311,6 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
         )
-        """
         
         self.splats_dict["mesh"] = create_splats(
             self.parser,
@@ -353,53 +330,36 @@ class Runner:
         
         
         if "mesh" in self.splats_dict:
-            self.optimizers_dict["mesh"] = self.splats_dict["mesh"].create_optimizers(means_lr=cfg.means_lr,
+            self.splats_dict["mesh"].create_optimizers(means_lr=cfg.means_lr,
                                                                             scales_lr=cfg.scales_lr, opacities_lr=cfg.opacities_lr,
                                                                             quats_lr=cfg.quats_lr, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
                                                                             batch_size= cfg.batch_size, world_size= world_size, 
-                                                                            sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam)
+                                                                            sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
         
         
         
         if "free" in self.splats_dict:
-            self.optimizers_dict["free"] = self.splats_dict["free"].create_optimizers(means_lr=cfg.means_lr * self.scene_scale, 
+            self.splats_dict["free"].create_optimizers(means_lr=cfg.means_lr * self.scene_scale, 
                                                                             scales_lr=cfg.scales_lr, opacities_lr=cfg.opacities_lr,
                                                                             quats_lr=cfg.quats_lr, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
                                                                             batch_size= cfg.batch_size, world_size= world_size, 
-                                                                            sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam)
+                                                                            sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
         
-        self.strategies_dict = {
-            "free": {"strategy": MCMCStrategy(), "state": None},
-            "mesh": {"strategy": None, "state": None}
+        strategies_dict = {
+            "free": MCMCStrategy(100_000),
+            "mesh": None
         }
+        self.splats_dict["free"].initialize_strategy(strategies_dict["free"], scene_scale=self.scene_scale)
+        strategies_dict = None
         
+        self.splats_dict = OrderedDict(sorted(self.splats_dict.items()))
         
         print("Model initialized. Number of splats: ", len(self.splats_dict))
         for k in self.splats_dict:
             print(f"\tSplat: {k}  |  Number Of GS: ", self.splats_dict[k].npoints())
-            assert k in self.optimizers_dict, "Not all splats have optimizers"
-            assert k in self.strategies_dict, "Not all splats have strategies"
+            assert self.splats_dict[k].optimizers is not None, "Not all splats have optimizers"
+            self.splats_dict[k].check_sanity()
             
-            # Densification Strategy
-            strategy = self.strategies_dict[k]["strategy"]
-            strategy_state = None
-            if not (strategy is None):
-                strategy.check_sanity(self.splats_dict[k].params_dict, self.optimizers_dict[k])
-                
-                if isinstance(strategy, DefaultStrategy):
-                    strategy_state = strategy.initialize_state(
-                        scene_scale=self.scene_scale
-                    )
-                elif isinstance(strategy, MCMCStrategy):
-                    strategy.cap_max = 100_000
-                    strategy_state = strategy.initialize_state()
-                else:
-                    assert_never(strategy)
-                
-            self.strategies_dict[k]["state"] = strategy_state
-            
-        
-        cfg.adjust_steps(cfg.steps_scaler ,[s["strategy"] for s in self.strategies_dict.values()])
         
         
 
@@ -620,6 +580,15 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
+    
+    
+    def gaussian_ids_per_splat_instance_from_info(self, info, cnt_per_splats_instance):
+        all_ids_flat = torch.zeros(np.sum(cnt_per_splats_instance),device=info["gaussian_ids"].device,dtype=bool)
+        all_ids_flat[info["gaussian_ids"]] = True
+        all_ids_flat = torch.split(all_ids_flat, cnt_per_splats_instance)
+        gaussian_ids = torch.where(all_ids_flat)
+        return gaussian_ids
+    
 
     def train(self):
         cfg = self.cfg
@@ -635,12 +604,7 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ) for optimizers in self.optimizers_dict.values()
-        ]
+        schedulers = [ ]
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -746,6 +710,8 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
             )
+            cnt_per_splats_instance = [s.npoints() for s in self.splats_dict.values()]
+            
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
@@ -770,14 +736,7 @@ class Runner:
                 colors = colors + bkgd * (1.0 - alphas)
 
             for splats_key in self.splats_dict:
-                if self.strategies_dict[splats_key]["strategy"] is None: continue
-                self.strategies_dict[splats_key]["strategy"].step_pre_backward(
-                    params=self.splats_dict[splats_key].params_dict,
-                    optimizers=self.optimizers_dict[splats_key],
-                    state=self.strategies_dict[splats_key]["state"],
-                    step=step,
-                    info=info,
-                )
+                self.splats_dict[splats_key].step_pre_backward(step=step, info=info)
             
             #pixels = pixels * total_mask
             #colors = colors * total_mask
@@ -944,8 +903,8 @@ class Runner:
                     sh0 = torch.cat([d["sh0"] for d in dicts])
                     shN = torch.cat([d["shN"] for d in dicts])
                 
-                scales = torch.log(scales) - torch.log(1.0-scales)
-                opacities = torch.log(opacities)
+                scales = torch.log(scales) 
+                opacities = torch.log(opacities ) - torch.log(1.0-opacities )
                 export_splats(
                     means=means,
                     scales=scales,
@@ -959,79 +918,60 @@ class Runner:
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
-                raise NotImplementedError("NOT IMPL")
                 assert cfg.packed, "Sparse gradients only work with packed mode."
-                gaussian_ids = info["gaussian_ids"]
-                for k in self.splats.keys():
-                    grad = self.splats[k].grad
-                    if grad is None or grad.is_sparse:
-                        continue
-                    self.splats[k].grad = torch.sparse_coo_tensor(
-                        indices=gaussian_ids[None],  # [1, nnz]
-                        values=grad[gaussian_ids],  # [nnz, ...]
-                        size=self.splats[k].size(),  # [N, ...]
-                        is_coalesced=len(Ks) == 1,
-                    )
+                gaussian_ids_per_instance = self.gaussian_ids_per_splat_instance_from_info(info,cnt_per_splats_instance)
+                for i_splat, splat in enumerate(self.splats_dict.values()):
+                    for k in splat.params_dict.keys():
+                        grad = splat.params_dict[k].grad
+                        if grad is None or grad.is_sparse:
+                            continue
+                        splat.params_dict[k].grad = torch.sparse_coo_tensor(
+                            indices=gaussian_ids_per_instance[i_splat][None],  # [1, nnz]
+                            values=grad[gaussian_ids_per_instance[i_splat]],  # [nnz, ...]
+                            size=splat.params_dict[k].size(),  # [N, ...]
+                            is_coalesced=len(Ks) == 1,
+                        )
+                        
 
             if cfg.visible_adam:
-                raise NotImplementedError("NOT IMPL")
-                gaussian_cnt = self.splats.means.shape[0]
+                visibility_mask = []
                 if cfg.packed:
-                    visibility_mask = torch.zeros_like(
-                        self.splats["opacities"], dtype=bool
-                    )
-                    visibility_mask.scatter_(0, info["gaussian_ids"], 1)
+                    gaussian_ids_per_instance = self.gaussian_ids_per_splat_instance_from_info(info, cnt_per_splats_instance)
+                    for i, splat in enumerate(self.splats_dict.values()):
+                        visibility_mask_i = torch.zeros_like(splat.params_dict["opacities"], dtype=bool)
+                        visibility_mask_i.scatter_(0, gaussian_ids_per_instance[i], 1)
+                        visibility_mask.append(visibility_mask_i)
                 else:
-                    visibility_mask = (info["radii"] > 0).all(-1).any(0)
+                    radii_per_instance = torch.split(info["radii"], cnt_per_splats_instance, 1)
+                    for i, radii in enumerate(radii_per_instance):
+                        visibility_mask.append((radii > 0).all(-1).any(0))
 
             # optimize
-            for optimizers in self.optimizers_dict.values():
-                for optimizer in optimizers.values():
-                    if cfg.visible_adam:
-                        raise NotImplementedError("NOT IMPL")
-                        optimizer.step(visibility_mask)
-                    else:
-                        optimizer.step()
+            for i, splat in enumerate(self.splats_dict.values()):
+                for optimizer in splat.optimizers.values():
+                    if (isinstance(optimizer, SelectiveAdam)): optimizer.step(visibility_mask[i])
+                    else: optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                for optimizer in self.pose_optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                for optimizer in self.app_optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                for optimizer in self.bil_grid_optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    
+            for optimizer in self.pose_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.app_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.bil_grid_optimizers:
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for scheduler in schedulers:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            for splats_key in self.splats_dict:
-                optimizers = self.optimizers_dict[splats_key]
-                splats = self.splats_dict[splats_key]
-                strategy = self.strategies_dict[splats_key]["strategy"]
-                if not (strategy is None): 
-                    strategy_state= self.strategies_dict[splats_key]["state"]
-                    if isinstance(strategy, DefaultStrategy):
-                        strategy.step_post_backward(
-                            params=splats.params_dict,
-                            optimizers=optimizers,
-                            state=strategy_state,
-                            step=step,
-                            info=info,
-                            packed=cfg.packed,
-                        )
-                    elif isinstance(strategy, MCMCStrategy):
-                        strategy.step_post_backward(
-                            params=splats.params_dict,
-                            optimizers=optimizers,
-                            state=strategy_state,
-                            step=step,
-                            info=info,
-                            lr=schedulers[0].get_last_lr()[0],
-                        )
-                    else:
-                        assert_never(strategy)
+            for splats in self.splats_dict.values():
+                splats.step_post_backward(
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

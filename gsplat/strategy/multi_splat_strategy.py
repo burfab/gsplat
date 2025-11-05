@@ -7,10 +7,11 @@ from torch import Tensor
 
 from .base import Strategy
 from .ops import inject_noise_to_position, relocate, sample_add
+from strategy import MCMCStrategy
 
 
 @dataclass
-class MCMCStrategy(Strategy):
+class MyMultiSplatStrategy(Strategy):
     """Strategy that follows the paper:
 
     `3D Gaussian Splatting as Markov Chain Monte Carlo <https://arxiv.org/abs/2404.09591>`_
@@ -46,27 +47,26 @@ class MCMCStrategy(Strategy):
 
     """
 
-    cap_max: int = 1_000_000
-    noise_lr: float = 5e5
-    refine_start_iter: int = 500
-    refine_stop_iter: int = 25_000
-    refine_every: int = 100
-    min_opacity: float = 0.005
-    verbose: bool = False
+    strategies : Dict[str, Strategy] = {
+        "free": MCMCStrategy(),
+        "mesh": Strategy()
+    }
 
-    def initialize_state(self, **kwargs) -> Dict[str, Any]:
+    def initialize_state(self, splats: Dict[str, int]) -> Dict[str,Dict[str, Any]]:
         """Initialize and return the running state for this strategy."""
-        n_max = 51
-        binoms = torch.zeros((n_max, n_max))
-        for n in range(n_max):
-            for k in range(n + 1):
-                binoms[n, k] = math.comb(n, k)
-        return {"binoms": binoms}
+        state = dict()
+        for s in splats:
+            state[s] = self.strategies[s].initialize_state()
+        return state
+    
+    def required_param_keys(self):
+        return ["means", "scales", "quats", "opacities"]
 
     def check_sanity(
         self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
+        splats: Dict[str,int],
+        params: Dict[str,Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict]],
+        optimizers: Dict[str,Dict[str, torch.optim.Optimizer]],
     ):
         """Sanity check for the parameters and optimizers.
 
@@ -83,68 +83,44 @@ class MCMCStrategy(Strategy):
             after initializing the strategy to ensure the convention of the parameters
             and optimizers is as expected.
         """
+        for s in self.strategies:
+            assert s in splats, "Needs " + s + " splat"
+            super().check_sanity(params[s], optimizers[s])
+            # The following keys are required for this strategy.
+            for key in self.required_param_keys():
+                assert key in params[s], f"{key} is required in params but missing."
 
-        super().check_sanity(params, optimizers)
-        # The following keys are required for this strategy.
-        for key in ["means", "scales", "quats", "opacities"]:
-            assert key in params, f"{key} is required in params but missing."
-
-    # def step_pre_backward(
-    #     self,
-    #     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-    #     optimizers: Dict[str, torch.optim.Optimizer],
-    #     # state: Dict[str, Any],
-    #     step: int,
-    #     info: Dict[str, Any],
-    # ):
-    #     """Callback function to be executed before the `loss.backward()` call."""
-    #     pass
+    def step_pre_backward(
+        self,
+        splats: Dict[str,int],
+        params: Dict[str,Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict]],
+        optimizers: Dict[str,Dict[str, torch.optim.Optimizer]],
+        state: Dict[str,Dict[str, Any]],
+        step: int,
+        info: Dict[str, Any],
+    ):
+        for s in splats:
+            self.strategies[s].step_pre_backward(params=params[s], optimizers=optimizers[s], state=state[s], step=step, info=info)
+            
 
     def step_post_backward(
         self,
-        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
-        optimizers: Dict[str, torch.optim.Optimizer],
-        state: Dict[str, Any],
+        splats: Dict[str,int],
+        params: Dict[str, Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict]],
+        optimizers: Dict[str,Dict[str, torch.optim.Optimizer]],
+        state: Dict[str,Dict[str, Any]],
         step: int,
         info: Dict[str, Any],
         lr: float,
-        **kwargs
     ):
         """Callback function to be executed after the `loss.backward()` call.
 
         Args:
             lr (float): Learning rate for "means" attribute of the GS.
         """
-        # move to the correct device
-        state["binoms"] = state["binoms"].to(params["means"].device)
-
-        binoms = state["binoms"]
-
-        if (
-            step < self.refine_stop_iter
-            and step > self.refine_start_iter
-            and step % self.refine_every == 0
-        ):
-            # teleport GSs
-            n_relocated_gs = self._relocate_gs(params, optimizers, binoms)
-            if self.verbose:
-                print(f"Step {step}: Relocated {n_relocated_gs} GSs.")
-
-            # add new GSs
-            n_new_gs = self._add_new_gs(params, optimizers, binoms)
-            if self.verbose:
-                print(
-                    f"Step {step}: Added {n_new_gs} GSs. "
-                    f"Now having {len(params['means'])} GSs."
-                )
-
-            torch.cuda.empty_cache()
-
-        if (step < self.refine_stop_iter and step > self.refine_start_iter):
-            # add noise to GSs
-            inject_noise_to_position(
-                params=params, optimizers=optimizers, state={}, scaler=lr * self.noise_lr
-            )
+        for s in splats:
+            self.strategies[s].step_post_backward(params=params[s], optimizers=optimizers[s], state=state[s], step=step, info=info, lr=lr)
+            
 
     @torch.no_grad()
     def _relocate_gs(

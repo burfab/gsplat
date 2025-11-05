@@ -128,7 +128,7 @@ class SimpleTrainer:
             optimizer.step()
             print(f"Iteration {iter + 1}/{iterations}, Loss: {loss.item()}")
 
-            if save_imgs and iter % 5 == 0:
+            if save_imgs and iter % 50 == 0:
                 frames.append((out_img.detach().cpu().numpy() * 255).astype(np.uint8))
         if save_imgs:
             # save them as a gif with PIL
@@ -161,11 +161,11 @@ def image_path_to_tensor(image_path: Path):
 def main(
     height: int = 256,
     width: int = 256,
-    num_points: int = 100000,
+    num_points: int = 10000,
     save_imgs: bool = True,
     img_path: Optional[Path] = None,
     iterations: int = 1000,
-    lr: float = 0.01,
+    lr: float = 0.1,
     model_type: Literal["3dgs", "2dgs"] = "3dgs",
 ) -> None:
     if img_path:

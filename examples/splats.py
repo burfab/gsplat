@@ -12,11 +12,67 @@ import open3d as o3d
 from gsplat.optimizers import SelectiveAdam
 from utils import rgb_to_sh, knn
 
+from gsplat.strategy import MCMCStrategy, Strategy
+
 # assumes you already have rgb_to_sh and knn available in scope
 # rgb_to_sh: (N,3) rgb in [0,1] -> (N,3) SH DC coeffs
 # knn(x,k):  (N,3), returns (N,k) distances to k nearest neighbors (just like your current code expects)
 
-class FreeSplats(nn.Module):
+
+class Splats(nn.Module):
+    
+    
+    def type_str(self) -> str:
+        pass
+    
+    def step_pre_backward(
+        self,
+        *args,
+        **kwargs,
+    ):
+        pass
+    
+    def step_post_backward(
+        self,
+        *args,
+        **kwargs,
+    ):
+        pass
+    
+    def check_sanity(self):
+        pass
+    
+    def create_optimizers(self, max_steps:int, *args, **kwargs):
+        pass
+    
+    def as_renderer_dict(self) ->Dict[str, torch.Tensor]:
+        pass
+    
+    def npoints(self) -> int: 
+        pass
+
+    def world_means(self) -> torch.Tensor:
+        # Already in world coords, directly learned
+        pass
+
+    def world_quats(self) -> torch.Tensor:
+        # Normalize so it's a proper unit quaternion
+        pass
+
+    def world_scales(self) -> torch.Tensor:
+        # Your training loop expects exp(scales) (since you store log scale).
+        # This mirrors how you do torch.exp(self.splats["scales"]) elsewhere.
+        pass
+
+    def world_opacities(self) -> torch.Tensor:
+        # Return sigmoid(opacities) if you need alpha in [0,1].
+        # BUT: in the train loop you keep "opacities" as logits to optimize and only do sigmoid() in loss.
+        # SurfaceSplats.as_renderer_dict() returned the logits (not the sigmoid).
+        # We'll follow that convention for consistency.
+        pass
+
+
+class FreeSplats(Splats):
     """
     Unconstrained (free) Gaussians in world coordinates.
 
@@ -38,7 +94,7 @@ class FreeSplats(nn.Module):
         - world_opacities()
         - as_renderer_dict()
     """
-    def type_str(self):
+    def type_str(self) -> str:
         return "FreeSplats"
 
     def __init__(
@@ -74,7 +130,12 @@ class FreeSplats(nn.Module):
             plain_params_dict["features"] = features.to(device)   # (N,F)
             plain_params_dict["colors"] = colors.to(device)       # (N,3) logits (like logit(rgb))
         
+        
+        self.optimizers = None
         self.params_dict = nn.ParameterDict(plain_params_dict)
+        
+    def check_sanity(self):
+        self.strategy.check_sanity(self.params_dict, self.optimizers)
                               
     # ---------------- world-space getters to match SurfaceSplats ---------------- #
     
@@ -85,7 +146,6 @@ class FreeSplats(nn.Module):
     @property
     def means(self):
         return self.__get_param_from_dict("means")
-    
     
     @property
     def scales(self):
@@ -134,6 +194,11 @@ class FreeSplats(nn.Module):
         # We'll follow that convention for consistency.
         return torch.sigmoid(self.opacities)
     
+    
+    
+    
+    
+    
     # The renderer-facing dict should match what rasterize_splats expects in your loop.
     def as_renderer_dict(self) -> Dict[str, torch.Tensor]:
         d = {
@@ -150,7 +215,42 @@ class FreeSplats(nn.Module):
             d["colors"]   = self.colors    # (N,3) logits
         return d
     
+    
+    
+    def step_pre_backward(
+        self,
+        step, info,
+        **kwargs,
+    ):
+        self.strategy.step_pre_backward(
+                    params=self.params_dict,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info, **kwargs)
+        pass
+
+    def step_post_backward(
+        self,
+        step, info,
+        **kwargs,
+    ):
+        for s in self.schedulers.values(): s.step()
+        kwargs_for_strategy = kwargs
+        if isinstance(self.strategy, MCMCStrategy): 
+            kwargs_for_strategy["lr"] = self.schedulers["means"].get_last_lr()[0]
+        self.strategy.step_post_backward(step=step, info=info, state = self.strategy_state,
+                                         params=self.params_dict, optimizers=self.optimizers, **kwargs_for_strategy)
+        pass
+
+    
+    
+    def initialize_strategy(self, strategy: Strategy = MCMCStrategy(100_000), **kwargs):
+        self.strategy = strategy
+        self.strategy_state = self.strategy.initialize_state(**kwargs)
+    
     def create_optimizers(self, 
+                          max_steps : int, 
                           means_lr: float, scales_lr: float, opacities_lr: float,
                           quats_lr: float, sh0_lr: float, shN_lr: float,
                           batch_size: int, world_size: int, 
@@ -183,7 +283,7 @@ class FreeSplats(nn.Module):
                 ("features", self.features, sh0_lr),
                 ("colors",   self.colors,   sh0_lr),
             ]
-        optimizers = {
+        self.optimizers = {
             name: optimizer_class(
                 [{
                     "params": [tensor],
@@ -195,10 +295,15 @@ class FreeSplats(nn.Module):
             )
             for (name, tensor, lr) in param_specs
         }
-
-        return optimizers
-
-
+        
+        self.schedulers = {}
+        for k in self.optimizers:
+            if k == "means":
+                self.schedulers[k] = torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers[k], gamma=0.01 ** (1.0 / max_steps)
+                )
+                
+        assert "means" in self.schedulers
 
 # You already have rgb_to_sh in your codebase. We'll assume it's available.
 # from utils.sh_utils import rgb_to_sh
@@ -207,7 +312,7 @@ def rotation_matrix_to_quat(R: torch.Tensor) -> torch.Tensor:
     return torchtransforms.matrix_to_quaternion(R)
 
 
-class SurfaceSplats(nn.Module):
+class SurfaceSplats(Splats):
     """
     Surface-attached Gaussian splats.
 
@@ -245,12 +350,14 @@ class SurfaceSplats(nn.Module):
         super().__init__()
         # trainables
         
+        z = torch.zeros((uv_params.shape[0],1), dtype=uv_params.dtype)
         plain_params_dict = {
             "uv_params":uv_params.to(device),# (N,2)
             "scales":scale_logits.to(device),# (N,3)
             "opacities":opacity_logits.to(device),# (N,)
             "sh0":sh0.to(device),#(N,1,3)
             "shN":shN.to(device),#N,K-1,3
+            "z":z.to(device),#N,K-1,3
             
         }
 
@@ -270,6 +377,8 @@ class SurfaceSplats(nn.Module):
         return None
     
     @property
+    def z(self): return self.__get_param_from_dict("z")
+    @property
     def uv_params(self): return self.__get_param_from_dict("uv_params")
     @property
     def scale(self): return self.__get_param_from_dict("scales")
@@ -288,8 +397,9 @@ class SurfaceSplats(nn.Module):
         o  = self.base_o[self.tri_ids]      # (N,3)
         e1 = self.base_e1[self.tri_ids]     # (N,3)
         e2 = self.base_e2[self.tri_ids]     # (N,3)
+        n  = self.base_n[self.tri_ids]      # (N,3)
         uv = self.uv_params                 # (N,2)
-        return o + uv[:,0:1]*e1 + uv[:,1:2]*e2
+        return o + uv[:,0:1]*e1 + uv[:,1:2]*e2 + self.z * n
 
     def world_quats(self) -> torch.Tensor:
         e1 = self.base_e1[self.tri_ids]     # (N,3)
@@ -317,8 +427,28 @@ class SurfaceSplats(nn.Module):
             "shN":       self.shN,                   # (N,K-1,3)
         }
         
+        
+    def step_pre_backward(
+        self,
+        step, info,
+        **kwargs,
+    ):
+        pass
+
+    def step_post_backward(
+        self,
+        step, info,
+        **kwargs,
+    ):
+        for s in self.schedulers.values(): s.step()
+        pass
+        
+    def check_sanity(self):
+        pass
+        
     def create_optimizers(
     self,
+    max_steps:int, 
     means_lr: float,
     scales_lr: float,
     opacities_lr: float,
@@ -359,9 +489,10 @@ class SurfaceSplats(nn.Module):
             ("opacity", self.opacity, opacities_lr),
             ("sh0",            self.sh0,            sh0_lr),
             ("shN",            self.shN,            shN_lr),
+            ("z",            self.z,            means_lr),
         ]
 
-        optimizers = {
+        self.optimizers = {
             name: optimizer_class(
                 [{
                     "params": [tensor],
@@ -374,7 +505,15 @@ class SurfaceSplats(nn.Module):
             for (name, tensor, lr) in param_specs
         }
 
-        return optimizers 
+        self.schedulers = {}
+        for k in self.optimizers:
+            if k == "means":
+                self.schedulers[k] = torch.optim.lr_scheduler.ExponentialLR(
+                    self.optimizers[k], gamma=0.01 ** (1.0 / max_steps)
+                )
+                
+        assert "means" in self.schedulers
+
 
 
 def create_surface_splats_from_mesh(
@@ -450,7 +589,7 @@ def create_surface_splats_from_mesh(
     base_scale = np.stack([
         mean_edge * init_scale,
         mean_edge * init_scale,
-        mean_edge * init_scale * 0.25,   # squash along normal
+        mean_edge * init_scale * 0.05,   # squash along normal
     ], axis=1).astype(np.float32)  # (F,3)
 
     # --- sample K points per triangle uniformly ---
