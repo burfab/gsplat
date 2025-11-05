@@ -164,7 +164,7 @@ class Config:
     pose_noise: float = 0.0
 
     # Enable appearance optimization. (experimental)
-    app_opt: bool = False
+    app_opt: bool = True
     # Appearance embedding dimension
     app_embed_dim: int = 16
     # Learning rate for appearance optimization
@@ -217,7 +217,7 @@ def create_splats(
     if init_type == "mesh":
         if mesh_path is None or len(mesh_path) == 0: assert False, "Mesh path may not be None or empty"
         mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        return splats.create_surface_splats_from_mesh(mesh_o3d, 4, sh_degree, init_opacity, init_scale, device)
+        return splats.create_surface_splats_from_mesh(mesh_o3d, 4, sh_degree, init_opacity, init_scale, feature_dim, device)
     elif init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -539,7 +539,7 @@ class Runner:
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = torch.cat([d["colors"] for d in dicts])
-            features = torch.cat(d["features"] for d in dicts)
+            features = torch.cat([d["features"] for d in dicts])
             colors = self.app_module(
                 features=features,
                 embed_ids=image_ids,
@@ -888,7 +888,7 @@ class Runner:
                     
                 if self.cfg.app_opt:
                     colors = torch.cat([d["colors"] for d in dicts])
-                    features = torch.cat(d["features"] for d in dicts)
+                    features = torch.cat([d["features"] for d in dicts])
                     rgb = self.app_module(
                         features=features,
                         embed_ids=image_ids,

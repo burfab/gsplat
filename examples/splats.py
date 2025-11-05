@@ -345,21 +345,32 @@ class SurfaceSplats(Splats):
         opacity_logits: torch.Tensor,      # (N,)
         sh0: torch.Tensor,                 # (N,1,3)
         shN: torch.Tensor,                 # (N,K-1,3)
+        features: torch.Tensor,
+        colors: torch.Tensor,
         device: str = "cuda",
     ):
         super().__init__()
         # trainables
+        
+        
+        
         
         z = torch.zeros((uv_params.shape[0],1), dtype=uv_params.dtype)
         plain_params_dict = {
             "uv_params":uv_params.to(device),# (N,2)
             "scales":scale_logits.to(device),# (N,3)
             "opacities":opacity_logits.to(device),# (N,)
-            "sh0":sh0.to(device),#(N,1,3)
-            "shN":shN.to(device),#N,K-1,3
             "z":z.to(device),#N,K-1,3
-            
         }
+        
+        # appearance
+        self._use_sh = sh0 is not None and shN is not None
+        if self._use_sh:
+            plain_params_dict["sh0"] = sh0.to(device)             # (N,1,3)
+            plain_params_dict["shN"] = shN.to(device)             # (N,K-1,3)
+        else:
+            plain_params_dict["features"] = features.to(device)   # (N,F)
+            plain_params_dict["colors"] = colors.to(device)       # (N,3) logits (like logit(rgb))
 
         # fixed buffers
         self.register_buffer("tri_ids", tri_ids.to(device))               # (N,)
@@ -388,6 +399,11 @@ class SurfaceSplats(Splats):
     def sh0(self): return self.__get_param_from_dict("sh0")
     @property
     def shN(self): return self.__get_param_from_dict("shN")
+    
+    @property
+    def colors(self): return self.__get_param_from_dict("colors")
+    @property
+    def features(self): return self.__get_param_from_dict("features")
     
     
     def npoints(self) -> int: return len(self.uv_params)
@@ -418,14 +434,21 @@ class SurfaceSplats(Splats):
         return torch.sigmoid(self.opacity)  # (N,1)
 
     def as_renderer_dict(self) -> dict:
-        return {
+        d = {
             "means":     self.world_means(),         # (N,3)
             "quats":     self.world_quats(),         # (N,4)
             "scales":    self.world_scales(),        # (N,3)
             "opacities": self.world_opacities(),        # logits, trainable
-            "sh0":       self.sh0,                   # (N,1,3)
-            "shN":       self.shN,                   # (N,K-1,3)
         }
+        
+        if self._use_sh:
+            d["sh0"] = self.sh0        # (N,1,3)
+            d["shN"] = self.shN        # (N,K-1,3)
+        else:
+            d["features"] = self.features  # (N,F)
+            d["colors"]   = self.colors    # (N,3) logits
+            
+        return d
         
         
     def step_pre_backward(
@@ -469,28 +492,35 @@ class SurfaceSplats(Splats):
         We'll still accept quats_lr argument just to keep the same signature,
         but we won't use it (orientation is determined by surface frame).
         """
-
+        
+        # 6. build per-parameter optimizers with per-param LRs
+        # same scaling rule you had: lr * sqrt(BS), eps / sqrt(BS)
         BS = batch_size * world_size
         if sparse_grad:
             optimizer_class = torch.optim.SparseAdam
         elif visible_adam:
-            optimizer_class = SelectiveAdam
+            optimizer_class = SelectiveAdam  # must exist in your code
         else:
             optimizer_class = torch.optim.Adam
-
-        # we map:
-        #   uv_params        -> means_lr           (same semantic role: position dof)
-        #   scale_logits     -> scales_lr
-        #   opacity_logits   -> opacities_lr
-        #   sh0, shN         -> sh0_lr, shN_lr
+        # map param names -> (tensor, lr)
         param_specs = [
             ("means",      self.uv_params,      means_lr),
-            ("scale",   self.scale,   scales_lr),
-            ("opacity", self.opacity, opacities_lr),
-            ("sh0",            self.sh0,            sh0_lr),
-            ("shN",            self.shN,            shN_lr),
-            ("z",            self.z,            means_lr),
+            ("scales",     self.scale,     scales_lr),
+            ("opacities",  self.opacity,  opacities_lr),
+            ("z",  self.z,  means_lr),
         ]
+
+        if self._use_sh:
+            param_specs += [
+                ("sh0",     self.sh0,       sh0_lr),
+                ("shN",     self.shN,       shN_lr),
+            ]
+        else:
+            # feature path
+            param_specs += [
+                ("features", self.features, sh0_lr),
+                ("colors",   self.colors,   sh0_lr),
+            ]
 
         self.optimizers = {
             name: optimizer_class(
@@ -522,6 +552,7 @@ def create_surface_splats_from_mesh(
     sh_degree: int,
     init_opacity: float,
     init_scale: float,
+    feature_dim: Optional[int],
     device: str = "cuda",
 )->SurfaceSplats:
     """
@@ -623,12 +654,27 @@ def create_surface_splats_from_mesh(
 
     # --- build SH coefficients for color ---
     # SH layout: (N, (sh_degree+1)^2, 3)
-    Ksh = (sh_degree + 1) ** 2
-    colors_sh = np.zeros((N, Ksh, 3), dtype=np.float32)
-    colors_sh[:, 0, :] = rgb_to_sh(torch.from_numpy(cols_flat)).cpu().numpy()
-    # remaining bands start at 0
-    sh0 = colors_sh[:, :1, :]        # (N,1,3)
-    shN = colors_sh[:, 1:, :]        # (N,Ksh-1,3)
+    
+    
+    if feature_dim is None:
+        Ksh = (sh_degree + 1) ** 2
+        colors_sh = np.zeros((N, Ksh, 3), dtype=np.float32)
+        colors_sh[:, 0, :] = rgb_to_sh(torch.from_numpy(cols_flat)).cpu().numpy()
+        # remaining bands start at 0
+        sh0 = colors_sh[:, :1, :]        # (N,1,3)
+        shN = colors_sh[:, 1:, :]        # (N,Ksh-1,3)
+        features_param = None
+        color_logits_param = None
+        
+        sh0 = torch.from_numpy(sh0).float()
+        shN = torch.from_numpy(shN).float()
+    else:
+        # Learnable per-splat features for an appearance network.
+        sh0 = None
+        shN = None
+        features_param = torch.rand((N, feature_dim), dtype=torch.float32)
+        # Store color as logits (inverse-sigmoid style) just like your original code
+        color_logits_param = torch.logit(torch.from_numpy(cols_flat).cpu().clamp(1e-4, 1-1e-4))  # (N,3)
 
     # --- opacity / scale logits init ---
     # opacity_logits = logit(init_opacity)
@@ -656,8 +702,10 @@ def create_surface_splats_from_mesh(
         base_scale       = base_scale_t,                               # (F,3)
         scale_logits     = scale_logits_init,                          # (N,3)
         opacity_logits   = opacity_logits,                             # (N,)
-        sh0              = torch.from_numpy(sh0).float(),              # (N,1,3)
-        shN              = torch.from_numpy(shN).float(),              # (N,Ksh-1,3)
+        sh0              = sh0,                                        # (N,1,3)
+        shN              = shN,                                        # (N,Ksh-1,3)
+        features         = features_param,                             # (N, Kfeatures)
+        colors           = color_logits_param,                         # (N,3)
         device           = device,
     )
 
