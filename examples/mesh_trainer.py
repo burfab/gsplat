@@ -65,7 +65,7 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
-    data_factor: int = 4
+    data_factor: int = 3
     # increase data factor at these iterations until we are at 1
     data_factor_up_steps = [2000, 5_000, 15_000, 24_000]
     # Directory to save results
@@ -148,6 +148,11 @@ class Config:
     sh0_lr: float = 2.5e-3
     # LR for higher-order SH (detail)
     shN_lr: float = 2.5e-3 / 20
+    
+    #laplacian regularizer
+    lambda_laplacian_loss = 40
+    #normal consistency regularizer
+    lambda_normal_consistency_loss = 1
 
     # Opacity regularization
     opacity_reg: float = 0.01
@@ -330,7 +335,7 @@ class Runner:
         
         
         if "mesh" in self.splats_dict:
-            self.splats_dict["mesh"].create_optimizers(means_lr=cfg.means_lr,
+            self.splats_dict["mesh"].create_optimizers(means_lr=cfg.means_lr * self.scene_scale,
                                                                             scales_lr=cfg.scales_lr, opacities_lr=cfg.opacities_lr,
                                                                             quats_lr=cfg.quats_lr, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
                                                                             batch_size= cfg.batch_size, world_size= world_size, 
@@ -349,7 +354,12 @@ class Runner:
             "free": MCMCStrategy(100_000),
             "mesh": None
         }
-        self.splats_dict["free"].initialize_strategy(strategies_dict["free"], scene_scale=self.scene_scale)
+        for splat_key in strategies_dict:
+            if splat_key in self.splats_dict and not (strategies_dict[splat_key] is None):
+                self.splats_dict[splat_key].initialize_strategy(strategies_dict[splat_key], scene_scale=self.scene_scale)
+                
+        self.splats_dict.pop("free")
+            
         strategies_dict = None
         
         self.splats_dict = OrderedDict(sorted(self.splats_dict.items()))
@@ -661,6 +671,12 @@ class Runner:
                     if (f != expected_factor):all_factors_good = False 
                 if all_factors_good: break
             
+            
+            for splat in self.splats_dict.values():
+                splat.prepare_render()
+                
+            if "mesh" in self.splats_dict:
+                self.splats_dict["mesh"].fix_geometry(not (step < 2000))
 
             camtoworlds_gt = data["camtoworld"].to(device)
             camtoworlds    = camtoworlds_gt.clone()
@@ -787,18 +803,41 @@ class Runner:
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                for k in self.splats_dict:
-                    loss = (
-                        loss
-                        + cfg.opacity_reg
-                        * torch.abs(self.splats_dict[k].world_opacities()).mean()
-                    )
+                for splat_key in ["free"]:
+                    if splat_key in self.splats_dict:
+                        loss = (
+                            loss
+                            + cfg.opacity_reg
+                            * torch.abs(self.splats_dict[splat_key].world_opacities()).mean()
+                        )
             if cfg.scale_reg > 0.0:
-                for k in self.splats_dict:
-                    loss = (
-                        loss
-                        + cfg.scale_reg * torch.abs(self.splats_dict[k].world_scales()).mean()
-                    )
+                for splat_key in ["free"]:
+                    if splat_key in self.splats_dict:
+                        loss = (
+                            loss
+                            + cfg.scale_reg * torch.abs(self.splats_dict[splat_key].world_scales()).mean()
+                        )
+                
+            normal_consistency_loss = {}
+            if cfg.lambda_normal_consistency_loss > 0.0:
+                for splat_key in ["mesh"]:
+                    if splat_key in self.splats_dict:
+                        normal_consistency_loss[splat_key] = self.splats_dict[splat_key].normal_consistency_loss()
+                        loss = (
+                            loss
+                            + cfg.lambda_normal_consistency_loss * normal_consistency_loss[splat_key]
+                        )
+            
+            laplacian_loss = {}
+            if cfg.lambda_laplacian_loss > 0.0:
+                if splat_key in self.splats_dict:
+                    for splat_key in ["mesh"]:
+                        laplacian_loss[splats_key] = self.splats_dict[splat_key].laplacian_loss()
+                        loss = (
+                            loss
+                            + cfg.lambda_laplacian_loss * laplacian_loss[splats_key]
+                        )
+                    
 
             loss.backward()
 
@@ -825,6 +864,10 @@ class Runner:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
+                if "mesh" in laplacian_loss:
+                    self.writer.add_scalar("train/laploss", laplacian_loss["mesh"].item(), step)
+                if "mesh" in normal_consistency_loss:
+                    self.writer.add_scalar("train/ncloss", normal_consistency_loss["mesh"].item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar(f"train/num_GS", num_GS, step)
                 self.writer.add_scalar("train/mem", mem, step)

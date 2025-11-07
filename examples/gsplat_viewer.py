@@ -88,7 +88,7 @@ class GsplatViewer(Viewer):
                         self.render_tab_state.near_plane,
                         self.render_tab_state.far_plane,
                     ),
-                    min=(1e-3, 1e1),
+                    min=(1e-3, 1e-1),
                     max=(1e1, 1e3),
                     step=1e-3,
                     hint="Near and far plane for rendering.",

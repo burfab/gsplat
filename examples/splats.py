@@ -13,6 +13,9 @@ from gsplat.optimizers import SelectiveAdam
 from utils import rgb_to_sh, knn
 
 from gsplat.strategy import MCMCStrategy, Strategy
+import surface_splat_utils
+import pytorch3d.structures
+import pytorch3d.loss
 
 # assumes you already have rgb_to_sh and knn available in scope
 # rgb_to_sh: (N,3) rgb in [0,1] -> (N,3) SH DC coeffs
@@ -23,6 +26,9 @@ class Splats(nn.Module):
     
     
     def type_str(self) -> str:
+        pass
+    
+    def prepare_render(self):
         pass
     
     def step_pre_backward(
@@ -331,16 +337,13 @@ class SurfaceSplats(Splats):
     
     def type_str(self):
         return "SurfaceSplats"
-
+    
     def __init__(
         self,
-        uv_params: torch.Tensor,           # (N,2)
+        bary_logits: torch.Tensor,         # (N,3)
         tri_ids: torch.Tensor,             # (N,)
-        base_o: torch.Tensor,              # (F,3)
-        base_e1: torch.Tensor,             # (F,3)
-        base_e2: torch.Tensor,             # (F,3)
-        base_n: torch.Tensor,              # (F,3)
-        base_scale: torch.Tensor,          # (F,3)
+        triangles : torch.Tensor,          # (F,3)
+        vertices: torch.Tensor,            # (V,3)
         scale_logits: torch.Tensor,        # (N,3)
         opacity_logits: torch.Tensor,      # (N,)
         sh0: torch.Tensor,                 # (N,1,3)
@@ -352,15 +355,16 @@ class SurfaceSplats(Splats):
         super().__init__()
         # trainables
         
+        self.render_buffer = {}
         
         
-        
-        z = torch.zeros((uv_params.shape[0],1), dtype=uv_params.dtype)
+        N_splats = scale_logits.shape[0]
         plain_params_dict = {
-            "uv_params":uv_params.to(device),# (N,2)
+            "vertices":vertices.to(device),# (V,3)
+            "bary_logits":bary_logits.to(device),# (N,3)
             "scales":scale_logits.to(device),# (N,3)
             "opacities":opacity_logits.to(device),# (N,)
-            "z":z.to(device),#N,K-1,3
+            "rotation_angle":torch.zeros(N_splats).float().to(device),# (N,)
         }
         
         # appearance
@@ -374,11 +378,7 @@ class SurfaceSplats(Splats):
 
         # fixed buffers
         self.register_buffer("tri_ids", tri_ids.to(device))               # (N,)
-        self.register_buffer("base_o", base_o.to(device))                 # (F,3)
-        self.register_buffer("base_e1", base_e1.to(device))               # (F,3)
-        self.register_buffer("base_e2", base_e2.to(device))               # (F,3)
-        self.register_buffer("base_n", base_n.to(device))                 # (F,3)
-        self.register_buffer("base_scale", base_scale.to(device))         # (F,3)
+        self.register_buffer("triangles", triangles.to(device))               # (N,)
         
         self.params_dict = nn.ParameterDict(plain_params_dict)
         
@@ -388,9 +388,11 @@ class SurfaceSplats(Splats):
         return None
     
     @property
-    def z(self): return self.__get_param_from_dict("z")
+    def bary_logits(self): return self.__get_param_from_dict("bary_logits")
     @property
-    def uv_params(self): return self.__get_param_from_dict("uv_params")
+    def vertices(self): return self.__get_param_from_dict("vertices")
+    @property
+    def rotation_angle(self): return self.__get_param_from_dict("rotation_angle")
     @property
     def scale(self): return self.__get_param_from_dict("scales")
     @property
@@ -399,36 +401,60 @@ class SurfaceSplats(Splats):
     def sh0(self): return self.__get_param_from_dict("sh0")
     @property
     def shN(self): return self.__get_param_from_dict("shN")
-    
     @property
     def colors(self): return self.__get_param_from_dict("colors")
     @property
     def features(self): return self.__get_param_from_dict("features")
     
+    def fix_geometry(self, val: bool):
+        self.vertices.requires_grad_(val)
     
-    def npoints(self) -> int: return len(self.uv_params)
+    def prepare_render(self):
+        tri_points = self.vertices[self.triangles]
+        meshes = pytorch3d.structures.Meshes(self.vertices[None,...], self.triangles[None,...])
+        tri_stats = surface_splat_utils.compute_tri_stats(tri_points, meshes, True, True, True)
+        bary = surface_splat_utils.barycentric_from_parameter_space(self.bary_logits)
+        splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary)
+        
+        
+        self.render_buffer = { 
+                              "meshes": meshes,
+                              "tri_points": tri_points,
+                              "tri_stats": tri_stats,
+                              "bary": bary,
+                              "means": splat_means,
+                              }
+    
+    def laplacian_loss(self):
+        return pytorch3d.loss.mesh_normal_consistency(self.render_buffer["meshes"])
+    def normal_consistency_loss(self):
+        return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"])
+    
+    def npoints(self) -> int: return len(self.tri_ids)
 
     # --- world-space reconstructions ---
     def world_means(self) -> torch.Tensor:
-        o  = self.base_o[self.tri_ids]      # (N,3)
-        e1 = self.base_e1[self.tri_ids]     # (N,3)
-        e2 = self.base_e2[self.tri_ids]     # (N,3)
-        n  = self.base_n[self.tri_ids]      # (N,3)
-        uv = self.uv_params                 # (N,2)
-        return o + uv[:,0:1]*e1 + uv[:,1:2]*e2 + self.z * n
+        return self.render_buffer["means"]
 
     def world_quats(self) -> torch.Tensor:
-        e1 = self.base_e1[self.tri_ids]     # (N,3)
-        e2 = self.base_e2[self.tri_ids]     # (N,3)
-        n  = self.base_n[self.tri_ids]      # (N,3)
-        R = torch.stack([e1, e2, n], dim=-1)  # (N,3,3)
+        n = self.render_buffer["tri_stats"]["normal"][self.tri_ids]
+        t,b = surface_splat_utils.onb_from_normal_frisvad(n) #(F,3),(F,3)
+        c = torch.cos(self.rotation_angle).unsqueeze(-1)
+        s = torch.sin(self.rotation_angle).unsqueeze(-1)
+        t_rot =  c * t + s * b
+        b_rot = -s * t + c * b 
+        
+        R = torch.stack([t_rot, b_rot, n], dim=-1)  # (F,3,3)
         return rotation_matrix_to_quat(R)     # (N,4)
 
     def world_scales(self) -> torch.Tensor:
         # base_scale gives us a per-triangle "typical" tangent vs normal extent
         # exp(scale_logits) is a multiplicative factor
-        bs = self.base_scale[self.tri_ids]                   # (N,3)
-        return torch.exp(self.scale) * bs             # (N,3)
+        bs = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])
+        s_rel = torch.ones_like(self.scale)
+        s_rel[...,2] = 0.05
+        s = torch.sigmoid(self.scale) * s_rel
+        return s * bs[self.tri_ids,...,None]             # (N,3)
 
     def world_opacities(self) -> torch.Tensor:
         return torch.sigmoid(self.opacity)  # (N,1)
@@ -496,18 +522,12 @@ class SurfaceSplats(Splats):
         # 6. build per-parameter optimizers with per-param LRs
         # same scaling rule you had: lr * sqrt(BS), eps / sqrt(BS)
         BS = batch_size * world_size
-        if sparse_grad:
-            optimizer_class = torch.optim.SparseAdam
-        elif visible_adam:
-            optimizer_class = SelectiveAdam  # must exist in your code
-        else:
-            optimizer_class = torch.optim.Adam
         # map param names -> (tensor, lr)
         param_specs = [
-            ("means",      self.uv_params,      means_lr),
+            ("means",      self.vertices, means_lr),
+            ("bary_logits",      self.bary_logits, means_lr*1e-3),
             ("scales",     self.scale,     scales_lr),
             ("opacities",  self.opacity,  opacities_lr),
-            ("z",  self.z,  means_lr),
         ]
 
         if self._use_sh:
@@ -521,9 +541,20 @@ class SurfaceSplats(Splats):
                 ("features", self.features, sh0_lr),
                 ("colors",   self.colors,   sh0_lr),
             ]
+            
+        def get_optimizer_class(param_name):
+            if param_name == "means": return torch.optim.Adam
+            if sparse_grad:
+                optimizer_class = torch.optim.SparseAdam
+            elif visible_adam:
+                optimizer_class = SelectiveAdam  # must exist in your code
+            else:
+                optimizer_class = torch.optim.Adam
+            return optimizer_class
+            
 
         self.optimizers = {
-            name: optimizer_class(
+            name: get_optimizer_class(name)(
                 [{
                     "params": [tensor],
                     "lr": lr * math.sqrt(BS),
@@ -567,99 +598,35 @@ def create_surface_splats_from_mesh(
     - build a SurfaceSplats module
     """
 
-    # --- gather mesh data ---
-    verts = np.asarray(mesh_o3d.vertices, dtype=np.float32)   # (V,3)
-    faces = np.asarray(mesh_o3d.triangles, dtype=np.int64)    # (F,3)
+    verts = torch.from_numpy(np.asarray(mesh_o3d.vertices, dtype=np.float32))   # (V,3)
+    faces = torch.from_numpy(np.asarray(mesh_o3d.triangles, dtype=np.int64))   # (F,3)
 
     if mesh_o3d.has_vertex_colors():
-        vcols = np.asarray(mesh_o3d.vertex_colors, dtype=np.float32)  # (V,3) in [0,1]
+        vcols = torch.from_numpy(np.asarray(mesh_o3d.vertex_colors, dtype=np.float32)).float()  # (V,3) in [0,1]
     else:
         mesh_o3d.compute_vertex_normals()
-        norms = np.asarray(mesh_o3d.vertex_normals, dtype=np.float32)
-        vcols = 0.5 * (norms + 1.0)
-
-    V0 = verts[faces[:,0]]  # (F,3)
-    V1 = verts[faces[:,1]]  # (F,3)
-    V2 = verts[faces[:,2]]  # (F,3)
-
-    C0 = vcols[faces[:,0]]  # (F,3)
-    C1 = vcols[faces[:,1]]  # (F,3)
-    C2 = vcols[faces[:,2]]  # (F,3)
+        norms = torch.from_numpy(np.asarray(mesh_o3d.vertex_normals, dtype=np.float32)).float()
+        vcols = 0.5 * (norms + 1.0) # random colors
 
     Fcount = faces.shape[0]
-    N = Fcount * K  # total splats
-
-    # --- build per-triangle tangent frame ---
-    # tangent e1 = (V1 - V0) normalized
-    e1_all = V1 - V0
-    e1_norm = np.linalg.norm(e1_all, axis=1, keepdims=True) + 1e-9
-    e1_all_norm = e1_all / e1_norm  # (F,3)
-
-    # temporary t2 = (V2 - V0), make e2 orthonormal to e1
-    t2 = V2 - V0
-    proj = (t2 * e1_all_norm).sum(axis=1, keepdims=True) * e1_all_norm
-    e2_all = t2 - proj
-    e2_norm = np.linalg.norm(e2_all, axis=1, keepdims=True) + 1e-9
-    e2_all_norm = e2_all / e2_norm  # (F,3)
-
-    # normal
-    n_all = np.cross(e1_all_norm, e2_all_norm)
-    n_norm = np.linalg.norm(n_all, axis=1, keepdims=True) + 1e-9
-    n_all_norm = n_all / n_norm     # (F,3)
-
-    # --- per-triangle base scale ---
-    # We'll use mean edge length as a base tangential extent,
-    # and shrink normal axis so splats stay "thin" against surface.
-    edge0 = np.linalg.norm(V1 - V0, axis=1)  # (F,)
-    edge1 = np.linalg.norm(V2 - V1, axis=1)
-    edge2 = np.linalg.norm(V0 - V2, axis=1)
-    mean_edge = (edge0 + edge1 + edge2) / 3.0  # (F,)
-
-    # base scale per tri, anisotropic: [tangent,tangent,normal]
-    # init_scale is a global multiplicative factor.
-    base_scale = np.stack([
-        mean_edge * init_scale,
-        mean_edge * init_scale,
-        mean_edge * init_scale * 0.05,   # squash along normal
-    ], axis=1).astype(np.float32)  # (F,3)
-
-    # --- sample K points per triangle uniformly ---
-    # Draw K barycentric samples per face.
-    # For uniform sampling in a triangle: sample u,v ~ U(0,1), if u+v>1 flip.
-    u = np.random.rand(Fcount, K, 1).astype(np.float32)
-    v = np.random.rand(Fcount, K, 1).astype(np.float32)
-    mask = (u + v > 1.0)
-    v[mask] = 1.0 - v[mask]
-    u[mask] = 1.0 - u[mask]
-    w = 1.0 - u - v  # weights for V0 (w), V1 (u), V2 (v)
-
-    # splat world positions (for sanity / debug)
-    P = w * V0[:,None,:] + u * V1[:,None,:] + v * V2[:,None,:]    # (F,K,3)
-
-    # per-splat color via barycentric blend
-    Col = w * C0[:,None,:] + u * C1[:,None,:] + v * C2[:,None,:]  # (F,K,3)
-
-    # convert world P to (a,b) in triangle tangent frame:
-    # rel = P - V0
-    # a = dot(rel, e1), b = dot(rel, e2)
-    rel = P - V0[:,None,:]                          # (F,K,3)
-    a = (rel * e1_all_norm[:,None,:]).sum(axis=2, keepdims=True)  # (F,K,1)
-    b = (rel * e2_all_norm[:,None,:]).sum(axis=2, keepdims=True)  # (F,K,1)
-    uv = np.concatenate([a,b], axis=2)  # (F,K,2)
-
-    # Flatten across triangles
-    uv_flat   = uv.reshape(-1, 2)            # (N,2)
-    cols_flat = Col.reshape(-1, 3)           # (N,3)
-    tri_ids   = np.repeat(np.arange(Fcount, dtype=np.int64), K)  # (N,)
-
+    N_splats = Fcount * K
+    splat_faces = torch.arange(0, Fcount, dtype=torch.int64)
+    splat_faces = torch.repeat_interleave(splat_faces, K)
+    
+    assert splat_faces.shape[0] == N_splats
+    
+    weights = surface_splat_utils.sample_barycentric(N_splats)
+    points = surface_splat_utils.points_from_barycentric(verts[faces[splat_faces]], weights)
+    colors = surface_splat_utils.points_from_barycentric(vcols[faces[splat_faces]], weights)
+    
     # --- build SH coefficients for color ---
     # SH layout: (N, (sh_degree+1)^2, 3)
     
     
     if feature_dim is None:
         Ksh = (sh_degree + 1) ** 2
-        colors_sh = np.zeros((N, Ksh, 3), dtype=np.float32)
-        colors_sh[:, 0, :] = rgb_to_sh(torch.from_numpy(cols_flat)).cpu().numpy()
+        colors_sh = np.zeros((N_splats, Ksh, 3), dtype=np.float32)
+        colors_sh[:, 0, :] = rgb_to_sh(colors).cpu().numpy()
         # remaining bands start at 0
         sh0 = colors_sh[:, :1, :]        # (N,1,3)
         shN = colors_sh[:, 1:, :]        # (N,Ksh-1,3)
@@ -672,34 +639,26 @@ def create_surface_splats_from_mesh(
         # Learnable per-splat features for an appearance network.
         sh0 = None
         shN = None
-        features_param = torch.rand((N, feature_dim), dtype=torch.float32)
+        features_param = torch.rand((N_splats, feature_dim), dtype=torch.float32)
         # Store color as logits (inverse-sigmoid style) just like your original code
-        color_logits_param = torch.logit(torch.from_numpy(cols_flat).cpu().clamp(1e-4, 1-1e-4))  # (N,3)
+        color_logits_param = torch.logit(colors.cpu().clamp(1e-4, 1-1e-4))  # (N,3)
 
     # --- opacity / scale logits init ---
     # opacity_logits = logit(init_opacity)
-    opacity_init = torch.full((N,), init_opacity, dtype=torch.float32)
+    opacity_init = torch.full((N_splats,), init_opacity, dtype=torch.float32)
     opacity_logits = torch.logit(opacity_init.clamp(1e-4, 1-1e-4))  # (N,)
 
     # scale_logits: start at zeros so exp(scale_logits)=1 → scale = base_scale[tri]
-    scale_logits_init = torch.zeros((N,3), dtype=torch.float32)
+    scale_logits_init = torch.zeros((N_splats,3), dtype=torch.float32)
+    bary_logits = surface_splat_utils.barycentric_to_parameter_space(weights)
 
-    # --- pack per-triangle bases as torch tensors ---
-    base_o_t  = torch.from_numpy(V0).float()               # (F,3) origin v0
-    base_e1_t = torch.from_numpy(e1_all_norm).float()      # (F,3)
-    base_e2_t = torch.from_numpy(e2_all_norm).float()      # (F,3)
-    base_n_t  = torch.from_numpy(n_all_norm).float()       # (F,3)
-    base_scale_t = torch.from_numpy(base_scale).float()    # (F,3)
 
     # --- create SurfaceSplats instance ---
     splats = SurfaceSplats(
-        uv_params        = torch.from_numpy(uv_flat).float(),          # (N,2)
-        tri_ids          = torch.from_numpy(tri_ids).long(),           # (N,)
-        base_o           = base_o_t,                                   # (F,3)
-        base_e1          = base_e1_t,                                  # (F,3)
-        base_e2          = base_e2_t,                                  # (F,3)
-        base_n           = base_n_t,                                   # (F,3)
-        base_scale       = base_scale_t,                               # (F,3)
+        bary_logits      = bary_logits,          # (N,3)
+        tri_ids          = splat_faces,          # (N,)
+        triangles        = faces,                # (N,3)
+        vertices         = verts,                                   # (F,3)
         scale_logits     = scale_logits_init,                          # (N,3)
         opacity_logits   = opacity_logits,                             # (N,)
         sh0              = sh0,                                        # (N,1,3)
