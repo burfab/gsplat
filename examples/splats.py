@@ -1,5 +1,6 @@
 import math
 from typing import Optional, Dict, Tuple
+from gsplat.strategy import ops as strategy_ops
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from gsplat.strategy import MCMCStrategy, Strategy
 import surface_splat_utils
 import pytorch3d.structures
 import pytorch3d.loss
+import pytorch3d.ops
 
 # assumes you already have rgb_to_sh and knn available in scope
 # rgb_to_sh: (N,3) rgb in [0,1] -> (N,3) SH DC coeffs
@@ -34,6 +36,13 @@ class Splats(nn.Module):
     def step_pre_backward(
         self,
         *args,
+        **kwargs,
+    ):
+        pass
+    
+    def on_loss_grad_computed(
+        self,
+        step,
         **kwargs,
     ):
         pass
@@ -259,11 +268,11 @@ class FreeSplats(Splats):
                           max_steps : int, 
                           means_lr: float, scales_lr: float, opacities_lr: float,
                           quats_lr: float, sh0_lr: float, shN_lr: float,
-                          batch_size: int, world_size: int, 
+                          batch_size: int, 
                           sparse_grad: bool = False, visible_adam: bool = False):
         # 6. build per-parameter optimizers with per-param LRs
         # same scaling rule you had: lr * sqrt(BS), eps / sqrt(BS)
-        BS = batch_size * world_size
+        BS = batch_size 
         if sparse_grad:
             optimizer_class = torch.optim.SparseAdam
         elif visible_adam:
@@ -355,7 +364,9 @@ class SurfaceSplats(Splats):
         super().__init__()
         # trainables
         
+        self.splat_thickness = None
         self.render_buffer = {}
+        self.strategy_state = {}
         
         
         N_splats = scale_logits.shape[0]
@@ -364,7 +375,7 @@ class SurfaceSplats(Splats):
             "bary_logits":bary_logits.to(device),# (N,3)
             "scales":scale_logits.to(device),# (N,3)
             "opacities":opacity_logits.to(device),# (N,)
-            "rotation_angle":torch.zeros(N_splats).float().to(device),# (N,)
+            "rotations":torch.zeros(N_splats).float().to(device),# (N,)
         }
         
         # appearance
@@ -392,7 +403,7 @@ class SurfaceSplats(Splats):
     @property
     def vertices(self): return self.__get_param_from_dict("vertices")
     @property
-    def rotation_angle(self): return self.__get_param_from_dict("rotation_angle")
+    def rotations(self): return self.__get_param_from_dict("rotations")
     @property
     def scale(self): return self.__get_param_from_dict("scales")
     @property
@@ -407,12 +418,12 @@ class SurfaceSplats(Splats):
     def features(self): return self.__get_param_from_dict("features")
     
     def fix_geometry(self, val: bool):
-        self.vertices.requires_grad_(val)
+        self.vertices.requires_grad_(not val)
     
     def prepare_render(self):
         tri_points = self.vertices[self.triangles]
         meshes = pytorch3d.structures.Meshes(self.vertices[None,...], self.triangles[None,...])
-        tri_stats = surface_splat_utils.compute_tri_stats(tri_points, meshes, True, True, True)
+        tri_stats = surface_splat_utils.compute_tri_stats(tri_points, meshes, True, True)
         bary = surface_splat_utils.barycentric_from_parameter_space(self.bary_logits)
         splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary)
         
@@ -425,22 +436,127 @@ class SurfaceSplats(Splats):
                               "means": splat_means,
                               }
     
-    def laplacian_loss(self):
-        return pytorch3d.loss.mesh_normal_consistency(self.render_buffer["meshes"])
     def normal_consistency_loss(self):
-        return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"])
+        return pytorch3d.loss.mesh_normal_consistency(self.render_buffer["meshes"])
+    def laplacian_loss(self, weight_type="cot"): #cot weights seem to promote slivers/fans
+        return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"],weight_type)
+    def edge_loss(self, target_len=None):
+        if target_len is None:
+            lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])     # (F,)
+            target_len = torch.median(lmax) 
+        return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],target_len)
+    
+    @torch.no_grad
+    def face_error_proj_on_normal(self):
+        grad = self.strategy_state["vertices_grad"]
+        proj_grad = grad[self.triangles] * self.normals()[:,None,...]
+        rij = torch.linalg.norm(proj_grad, dim=-1)
+        ri = rij.sum(dim=-1)
+        return ri
+    
+    def do_subdivide(self, step):
+        return step % 2000 == 0 and step >= 2500 and step <= 20_000
+    
+    def face_error_top_q_mask(self, q:float, th_min:float = 0.06):
+        k = q * self.triangles.shape[0]
+        k = int(min(self.triangles.shape[0]-1, k))
+        if k <= 0: return None
+        ri = self.face_error_proj_on_normal()
+        adaptive_th = max(ri.sort(descending=True)[0][k], th_min)
+        mask = ri >= adaptive_th
+        return mask
+    
+
+
+
+    
+    @torch.no_grad
+    def subdivide_and_create_splats(self,q:float,k:int, face_error_min_th:float):
+        mask_split = self.face_error_top_q_mask(q,face_error_min_th)
+        if mask_split is None: return 
+        device = self.vertices.device
+        triangle_index_shift = mask_split.cumsum(0) #to subtract from old triangle indices, as they will be shifted
+        
+        
+        #remove all splats on touched faces
+        #create k new splats per face, initialize by nearest splat 
+        vertices_new, triangles_new = surface_splat_utils.midpoint_subdivide(self.vertices, self.triangles, mask_split)
+        assert len(triangles_new) >= len(self.triangles)
+        
+        new_vertices_mask = torch.ones(len(vertices_new), dtype=bool, device=device)
+        new_vertices_mask[:len(self.vertices)] = False
+        
+        new_faces_mask = torch.ones(len(triangles_new), dtype=bool, device=device)
+        new_faces_mask[:len(self.triangles)-mask_split.sum()] = False
+        
+        
+        tri_pts_new = vertices_new[triangles_new[new_faces_mask]].repeat_interleave(k,dim=0)
+        tri_ids_new = torch.where(new_faces_mask)[0].repeat_interleave(k).to(device)
+        weights_new = surface_splat_utils.sample_barycentric(len(tri_ids_new)).to(device)
+        query_pts = surface_splat_utils.points_from_barycentric(tri_pts_new,weights_new)
+        
+        number_new_splats = len(query_pts)
+        
+        
+        _, nn_idx, _ = pytorch3d.ops.knn_points(query_pts[None,...], self.world_means()[None,...], K=1)
+        assert nn_idx.shape[0] == 1 and nn_idx.shape[2] == 1
+        nn_idx = nn_idx[0,:,0]
+        
+        untouched_splats_mask = (~mask_split)[self.tri_ids]
+        
+        update = {}
+        update["scales"] = self.scale[nn_idx[:]]
+        update["rotations"] = self.rotations[nn_idx]
+        update["opacities"] = self.opacity[nn_idx]
+        update["bary_logits"] = surface_splat_utils.barycentric_to_parameter_space(weights_new)
+        if self._use_sh:
+            update["sh0"] = self.sh0[nn_idx[:]]
+            update["shN"] = self.shN[nn_idx[:]]
+        else:
+            update["features"]= self.features[nn_idx[:]]
+            update["colors"]= self.colors[nn_idx[:]]
+        
+        def param_fn(name: str, p: torch.Tensor) -> torch.Tensor:
+            p_new = torch.cat((p[untouched_splats_mask], update[name]))
+            return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+
+        def optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
+            v_new = torch.zeros((number_new_splats, *v.shape[1:]), device=device,dtype=v.dtype)
+            return torch.cat((v[untouched_splats_mask], v_new))
+        
+        def param_fn_vertices(name: str, p: torch.Tensor) -> torch.Tensor:
+            return torch.nn.Parameter(vertices_new, requires_grad=p.requires_grad)
+
+        def optimizer_fn_vertices(key: str, v: torch.Tensor) -> torch.Tensor:
+            v_new = torch.zeros((max(0,len(vertices_new)-len(v)), *v.shape[1:]), device=device,dtype=v.dtype)
+            return torch.cat((v,v_new))
+        
+        
+        
+        strategy_ops._update_param_with_optimizer(param_fn, optimizer_fn, self.params_dict, self.optimizers,update.keys())
+        strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]))
+        
+        self.register_buffer("tri_ids", torch.cat(((self.tri_ids-triangle_index_shift[self.tri_ids])[untouched_splats_mask],tri_ids_new.to(device))))
+        assert not (self.tri_ids < 0).any()
+        self.register_buffer("triangles", triangles_new.to(device))
+        
+        self.prepare_render()
     
     def npoints(self) -> int: return len(self.tri_ids)
 
     # --- world-space reconstructions ---
     def world_means(self) -> torch.Tensor:
         return self.render_buffer["means"]
+    
+    def normals(self) -> torch.Tensor:
+        return self.render_buffer["meshes"].faces_normals_list()[0]
+
 
     def world_quats(self) -> torch.Tensor:
-        n = self.render_buffer["tri_stats"]["normal"][self.tri_ids]
+        n = self.normals()[self.tri_ids]
         t,b = surface_splat_utils.onb_from_normal_frisvad(n) #(F,3),(F,3)
-        c = torch.cos(self.rotation_angle).unsqueeze(-1)
-        s = torch.sin(self.rotation_angle).unsqueeze(-1)
+        c = torch.cos(self.rotations).unsqueeze(-1)
+        s = torch.sin(self.rotations).unsqueeze(-1)
         t_rot =  c * t + s * b
         b_rot = -s * t + c * b 
         
@@ -448,13 +564,34 @@ class SurfaceSplats(Splats):
         return rotation_matrix_to_quat(R)     # (N,4)
 
     def world_scales(self) -> torch.Tensor:
-        # base_scale gives us a per-triangle "typical" tangent vs normal extent
-        # exp(scale_logits) is a multiplicative factor
-        bs = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])
-        s_rel = torch.ones_like(self.scale)
-        s_rel[...,2] = 0.05
-        s = torch.sigmoid(self.scale) * s_rel
-        return s * bs[self.tri_ids,...,None]             # (N,3)
+        # Per-face stats
+        lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])     # (F,)
+        # Optional scene scale for absolute thickness (median keeps it robust)
+        with torch.no_grad():
+            if self.splat_thickness is None:
+                self.splat_thickness = torch.median(lmax)
+
+        # Base (per face): tangent scales from longest edge, bitangent a fraction,
+        # normal is absolute thinness independent of triangle size.
+        s_base_face = torch.stack([
+            0.35 * lmax,                # σ_t0
+            0.35 * lmax,          # σ_t1 (slightly smaller than t0)
+            1e-4 * self.splat_thickness.expand_as(lmax)  # σ_n (paper-thin)
+        ], dim=-1)  # (F,3)
+
+        s_base = s_base_face[self.tri_ids]  # (N,3)
+
+        # Learnable multiplicative factor: exp(log_range * tanh(raw))
+        # raw initialized to 0 => factor = 1
+        log_range = 1.0  # ±1 in log => x∈[e^-1, e^+1] ≈ [0.37, 2.72]
+        factor = torch.exp(log_range * torch.tanh(self.scale))  # (N,3)
+
+        s = s_base * factor
+
+        # Numerical floor
+        eps = 1e-6 * float(self.splat_thickness)
+        return s.clamp_min(eps)  # (N,3)
+
 
     def world_opacities(self) -> torch.Tensor:
         return torch.sigmoid(self.opacity)  # (N,1)
@@ -477,6 +614,20 @@ class SurfaceSplats(Splats):
         return d
         
         
+    def on_loss_grad_computed(
+        self,
+        step,
+        **kwargs,
+    ):
+        if not "vertices_grad" in self.strategy_state:
+            self.strategy_state["vertices_grad"] = torch.zeros_like(self.vertices,requires_grad=False)
+            self.strategy_state["vertices_grad_collected_cnt"] = 0
+            
+        exp_decay = 0.1
+        with torch.no_grad():
+            self.strategy_state["vertices_grad"] = (torch.zeros_like(self.vertices,requires_grad=False) if self.vertices.grad is None else self.vertices.grad) * (exp_decay) + self.strategy_state["vertices_grad"] * (1.0-exp_decay)
+            self.strategy_state["vertices_grad_collected_cnt"] += 1
+        
     def step_pre_backward(
         self,
         step, info,
@@ -486,9 +637,22 @@ class SurfaceSplats(Splats):
 
     def step_post_backward(
         self,
-        step, info,
+        step, info, subdivision_options = {},
         **kwargs,
     ):
+        if self.do_subdivide(step): 
+            torch.save(self.triangles, "/tmp/triangles.pyt");
+            torch.save(self.vertices, "/tmp/vertices.pyt") 
+            q = subdivision_options.get("q", 0.02) 
+            k = subdivision_options.get("splats_per_tri", 1) 
+            face_error_min_th = subdivision_options.get("face_error_min_th", 0.001) 
+            self.subdivide_and_create_splats(q,k, face_error_min_th)
+            self.strategy_state.pop("vertices_grad")
+            self.strategy_state.pop("vertices_grad_collected_cnt")
+            torch.cuda.empty_cache()
+            torch.save(self.triangles, "/tmp/triangles_subdived.pyt");
+            torch.save(self.vertices, "/tmp/vertices_subdived.pyt") 
+            
         for s in self.schedulers.values(): s.step()
         pass
         
@@ -505,7 +669,6 @@ class SurfaceSplats(Splats):
     sh0_lr: float,
     shN_lr: float,
     batch_size: int,
-    world_size: int,
     sparse_grad: bool = False,
     visible_adam: bool = False) -> Dict[str, torch.optim.Optimizer]:
         """
@@ -521,13 +684,14 @@ class SurfaceSplats(Splats):
         
         # 6. build per-parameter optimizers with per-param LRs
         # same scaling rule you had: lr * sqrt(BS), eps / sqrt(BS)
-        BS = batch_size * world_size
+        BS = batch_size 
         # map param names -> (tensor, lr)
         param_specs = [
-            ("means",      self.vertices, means_lr),
+            ("vertices",      self.vertices, means_lr),
             ("bary_logits",      self.bary_logits, means_lr*1e-3),
             ("scales",     self.scale,     scales_lr),
             ("opacities",  self.opacity,  opacities_lr),
+            ("rotations",  self.rotations,  quats_lr),
         ]
 
         if self._use_sh:
@@ -543,7 +707,7 @@ class SurfaceSplats(Splats):
             ]
             
         def get_optimizer_class(param_name):
-            if param_name == "means": return torch.optim.Adam
+            if param_name == "vertices": return torch.optim.Adam
             if sparse_grad:
                 optimizer_class = torch.optim.SparseAdam
             elif visible_adam:
@@ -568,12 +732,12 @@ class SurfaceSplats(Splats):
 
         self.schedulers = {}
         for k in self.optimizers:
-            if k == "means":
+            if k == "vertices":
                 self.schedulers[k] = torch.optim.lr_scheduler.ExponentialLR(
                     self.optimizers[k], gamma=0.01 ** (1.0 / max_steps)
                 )
                 
-        assert "means" in self.schedulers
+        assert "vertices" in self.schedulers
 
 
 
