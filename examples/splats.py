@@ -481,13 +481,22 @@ class SurfaceSplats(Splats):
         #remove all splats on touched faces
         #create k new splats per face, initialize by nearest splat 
         vertices_new, triangles_new = surface_splat_utils.midpoint_subdivide(self.vertices, self.triangles, mask_split)
+        
+        cnt_verts_old = len(vertices_new[0]); cnt_verts_new = len(vertices_new[1]);
+        cnt_tris_old = len(triangles_new[0]); cnt_tris_new = len(triangles_new[1]);
+        
+        vertices_new = torch.cat(vertices_new)
+        triangles_new = torch.cat(triangles_new)
+        
+        
+        
         assert len(triangles_new) >= len(self.triangles)
         
         new_vertices_mask = torch.ones(len(vertices_new), dtype=bool, device=device)
-        new_vertices_mask[:len(self.vertices)] = False
+        new_vertices_mask[:cnt_verts_old] = False
         
         new_faces_mask = torch.ones(len(triangles_new), dtype=bool, device=device)
-        new_faces_mask[:len(self.triangles)-mask_split.sum()] = False
+        new_faces_mask[:cnt_tris_old] = False
         
         
         tri_pts_new = vertices_new[triangles_new[new_faces_mask]].repeat_interleave(k,dim=0)
@@ -537,8 +546,9 @@ class SurfaceSplats(Splats):
         strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]))
         
         self.register_buffer("tri_ids", torch.cat(((self.tri_ids-triangle_index_shift[self.tri_ids])[untouched_splats_mask],tri_ids_new.to(device))))
-        assert not (self.tri_ids < 0).any()
         self.register_buffer("triangles", triangles_new.to(device))
+        
+        assert not (self.tri_ids < 0).any()
         
         self.prepare_render()
     

@@ -78,8 +78,7 @@ def midpoint_subdivide(vertices:torch.Tensor, triangles:torch.Tensor, mask_split
     
 
     V_new = mesh_new.verts_list()[0]
-    T_new = torch.cat((unmasked_faces,mesh_new.faces_list()[0])) 
-    return V_new, T_new
+    return (V_new[:len(vertices)], V_new[len(vertices):]), (unmasked_faces, mesh_new.faces_list()[0])
     
 @torch.no_grad()
 def midpoint_subdivide_masked(
