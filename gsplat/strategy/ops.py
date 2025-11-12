@@ -51,6 +51,7 @@ def _update_param_with_optimizer(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],
     names: Union[List[str], None] = None,
+    optimizer_step_fn: Union[Callable[[str, Tensor], Tensor],None] = None,
 ):
     """Update the parameters and the state in the optimizers with defined functions.
 
@@ -85,6 +86,9 @@ def _update_param_with_optimizer(
                 if key != "step":
                     v = param_state[key]
                     param_state[key] = optimizer_fn(key, v)
+                elif key == "step" and not optimizer_step_fn is None:
+                    v = param_state[key]
+                    param_state[key] = optimizer_step_fn(key, v)
             optimizer.param_groups[i]["params"] = [new_param]
             optimizer.state[new_param] = param_state
 

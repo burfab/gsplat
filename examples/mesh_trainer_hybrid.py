@@ -673,9 +673,13 @@ class Runner:
         trainloader_iter = iter(trainloader)
 
         # Training loop.
+        
+        force_fix_geometry_flag = False
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        last_subdivide = None
         for step in pbar:
+            if last_subdivide is None: last_subdivide = step
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -695,7 +699,9 @@ class Runner:
                 if all_factors_good: break
             
             if "mesh" in self.splats_dict:
-                self.splats_dict["mesh"].fix_geometry((step <= 1000))
+                if self.splats_dict["mesh"].do_subdivide(step): last_subdivide = step
+                self.splats_dict["mesh"].fix_geometry((step <= 1000) or force_fix_geometry_flag or (step-last_subdivide)<500)
+                
             
             for splat in self.splats_dict.values():
                 splat.prepare_render()
@@ -877,12 +883,12 @@ class Runner:
                     
 
             loss_data_term.backward(retain_graph=True)
+            if loss_geometry_term != 0.0 and loss_geometry_term.requires_grad:
+                loss_geometry_term.backward(retain_graph=True)
             
             for s in self.splats_dict.values():
                 s.on_loss_grad_computed(step)
             
-            if loss_geometry_term != 0.0 and loss_geometry_term.requires_grad:
-                loss_geometry_term.backward(retain_graph=True)
                 
             loss = loss_data_term + loss_geometry_term
 

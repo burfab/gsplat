@@ -446,7 +446,7 @@ class SurfaceSplats(Splats):
             target_len = torch.median(lmax) 
         return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],target_len)
     
-    @torch.no_grad
+    @torch.no_grad()
     def face_error_proj_on_normal(self):
         grad = self.strategy_state["vertices_grad"]
         proj_grad = grad[self.triangles] * self.normals()[:,None,...]
@@ -455,7 +455,7 @@ class SurfaceSplats(Splats):
         return ri
     
     def do_subdivide(self, step):
-        return step % 2000 == 0 and step >= 2500 and step <= 20_000
+        return step % 2000 == 0 and step >= 1500 and step <= 20_000
     
     def face_error_top_q_mask(self, q:float, th_min:float = 0.06):
         k = q * self.triangles.shape[0]
@@ -470,7 +470,7 @@ class SurfaceSplats(Splats):
 
 
     
-    @torch.no_grad
+    @torch.no_grad()
     def subdivide_and_create_splats(self,q:float,k:int, face_error_min_th:float):
         mask_split = self.face_error_top_q_mask(q,face_error_min_th)
         if mask_split is None: return 
@@ -480,15 +480,13 @@ class SurfaceSplats(Splats):
         
         #remove all splats on touched faces
         #create k new splats per face, initialize by nearest splat 
-        vertices_new, triangles_new = surface_splat_utils.midpoint_subdivide(self.vertices, self.triangles, mask_split)
+        vertices_new, triangles_new = surface_splat_utils.triangle_incenter_subdivide(self.vertices, self.triangles, mask_split)
         
         cnt_verts_old = len(vertices_new[0]); cnt_verts_new = len(vertices_new[1]);
         cnt_tris_old = len(triangles_new[0]); cnt_tris_new = len(triangles_new[1]);
         
         vertices_new = torch.cat(vertices_new)
         triangles_new = torch.cat(triangles_new)
-        
-        
         
         assert len(triangles_new) >= len(self.triangles)
         
@@ -499,8 +497,8 @@ class SurfaceSplats(Splats):
         new_faces_mask[:cnt_tris_old] = False
         
         
-        tri_pts_new = vertices_new[triangles_new[new_faces_mask]].repeat_interleave(k,dim=0)
         tri_ids_new = torch.where(new_faces_mask)[0].repeat_interleave(k).to(device)
+        tri_pts_new = vertices_new[triangles_new[tri_ids_new]]
         weights_new = surface_splat_utils.sample_barycentric(len(tri_ids_new)).to(device)
         query_pts = surface_splat_utils.points_from_barycentric(tri_pts_new,weights_new)
         
@@ -538,12 +536,16 @@ class SurfaceSplats(Splats):
 
         def optimizer_fn_vertices(key: str, v: torch.Tensor) -> torch.Tensor:
             v_new = torch.zeros((max(0,len(vertices_new)-len(v)), *v.shape[1:]), device=device,dtype=v.dtype)
-            return torch.cat((v,v_new))
+            return torch.cat((v*0.0,v_new))
+        def optimizer_fn_step_vertices(key: str, v: torch.Tensor) -> torch.Tensor:
+            v[...] = 0.0
+            return v
+        
         
         
         
         strategy_ops._update_param_with_optimizer(param_fn, optimizer_fn, self.params_dict, self.optimizers,update.keys())
-        strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]))
+        strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]),optimizer_fn_step_vertices)
         
         self.register_buffer("tri_ids", torch.cat(((self.tri_ids-triangle_index_shift[self.tri_ids])[untouched_splats_mask],tri_ids_new.to(device))))
         self.register_buffer("triangles", triangles_new.to(device))
@@ -725,7 +727,6 @@ class SurfaceSplats(Splats):
             else:
                 optimizer_class = torch.optim.Adam
             return optimizer_class
-            
 
         self.optimizers = {
             name: get_optimizer_class(name)(
