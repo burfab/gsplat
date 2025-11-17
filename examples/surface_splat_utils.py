@@ -15,6 +15,27 @@ def barycentric_to_parameter_space(X:torch.Tensor)->torch.Tensor:
     return torch.log(X)
 def barycentric_from_parameter_space(X:torch.Tensor, dim=-1)->torch.Tensor:
     return torch.softmax(X,dim=-1)
+def barycentric_to_reduced_parameter_space(bary: torch.Tensor) -> torch.Tensor:
+    """
+    bary: (..., 3) tensor with [u, v, w], u+v+w=1
+    returns: (..., 2) logits [a, b]
+    """
+    eps = 1e-8
+    u = bary[..., 0]
+    v = bary[..., 1]
+    w = bary[..., 2].clamp_min(eps)  # avoid division by zero
+
+    a = torch.log(u.clamp_min(eps) / w)
+    b = torch.log(v.clamp_min(eps) / w)
+    return torch.stack((a, b), dim=-1)
+def barycentric_from_reduced_parameter_space(X:torch.Tensor)->torch.Tensor:
+    Xmax = torch.amax(X, dim=-1, keepdim=True)
+    eX = torch.exp(X - Xmax)
+    ones = torch.ones_like(eX[..., :1])
+    numer = torch.cat((eX, ones), dim=-1)
+    denom = numer.sum(dim=-1, keepdim=True)
+    return numer / denom
+
 def points_from_barycentric(triangle_points:torch.Tensor, weights:torch.Tensor)->torch.Tensor:
     return torch.einsum("kij,kli->kj", triangle_points, weights)
 
@@ -76,7 +97,87 @@ def midpoint_subdivide(vertices:torch.Tensor, triangles:torch.Tensor, mask_split
     mesh_new = pytorch3d.structures.Meshes(vertices[None,...],masked_faces[None,...])
     mesh_new = pytorch3d.ops.SubdivideMeshes()(mesh_new)
     V_new = mesh_new.verts_list()[0]
-    return (V_new[:len(vertices)], V_new[len(vertices):]), (unmasked_faces, mesh_new.faces_list()[0])
+    return (V_new[:len(vertices)], V_new[len(vertices):]), (unmasked_faces, mesh_new.faces_list()[0]), ~mask_split
+
+
+def masked_midpoint_subdivide(V,T, mask):
+    def compute_keys(T, max_el, edge_indices):
+        AB = T[...,edge_indices[0]]
+        CA = T[...,edge_indices[1]]
+        BC = T[...,edge_indices[2]]
+        keys = torch.stack((AB,CA,BC),dim=1)
+        keys = torch.sort(keys)[0]
+        keys[...,0] *= max_el
+        keys = keys.sum(-1)
+        return keys
+        
+        
+    edge_indices = [[0,1], [2,0], [1,2]]
+    all_keys = compute_keys(T, T.max(), edge_indices).cpu().detach().numpy()
+    masked_keys = compute_keys(T[mask], T.max(), edge_indices).cpu().detach().numpy()
+
+    V_cpu = V.cpu().detach().numpy()
+    T_cpu = T.cpu().detach().numpy()
+    T_masked_cpu = T[mask].cpu().detach().numpy()
+    midpoints = {}
+    new_vertices_idx_counter = len(V)
+    for i in range(len(masked_keys)):
+        tri_keys = masked_keys[i]
+        for ei in range(3):
+            key_ei = tri_keys[ei].item()
+            if not key_ei in midpoints:
+                midpoints[key_ei] = (V_cpu[T_masked_cpu[i,edge_indices[ei]]].mean(0).tolist(),new_vertices_idx_counter)
+                new_vertices_idx_counter += 1
+
+    new_vertices = np.zeros((len(midpoints),3), dtype=V_cpu.dtype)
+    for v, idx in midpoints.values(): new_vertices[idx-len(V)] = v
+            
+    new_faces_cnt = np.zeros(len(T),dtype=int)
+    for i in range(len(T_cpu)):
+        tri_keys = all_keys[i]
+        split_edges = [False, False, False]
+        split_cnt = 0
+        for ei in range(3):
+            if tri_keys[ei].item() in midpoints:
+                split_edges[ei]=True
+                split_cnt+=1
+        if split_cnt == 0: continue
+        new_faces_cnt[i] = (split_cnt+1)
+
+    new_faces_start_index = new_faces_cnt.cumsum()
+    new_faces = np.zeros((new_faces_start_index[-1],3), dtype=T_cpu.dtype)
+    for i in range(len(T_cpu)):
+        split_cnt = new_faces_cnt[i]-1
+        if split_cnt <= 0: continue
+        #ATTENTION: this depends on order of edge_indices
+        key_AB,key_CA, key_BC = all_keys[i]
+        A,B,C = T_cpu[i]
+        d,e,f = (None,None,None)
+        if key_AB in midpoints: d = midpoints[key_AB][1]
+        if key_BC in midpoints: e = midpoints[key_BC][1]
+        if key_CA in midpoints: f = midpoints[key_CA][1]
+        start_idx = 0 if i == 0 else new_faces_start_index[i-1]
+        faces_to_add = None
+        if split_cnt == 3:
+            faces_to_add = [[A,d,f], [d,B,e], [e,C,f], [d,e,f]]
+        elif split_cnt == 2:
+            if f is None: faces_to_add = [[d,B,e], [d,e,C], [A,d,C]]
+            elif e is None: faces_to_add = [[A,d,f], [d,C,f], [d,B,C]]
+            elif d is None: faces_to_add = [[A,e,f], [f,e,C], [A,B,e]]
+        elif split_cnt == 1:
+            if not d is None: faces_to_add = [[A,d,C], [d,B,C]]
+            elif not e is None: faces_to_add = [[A,B,e], [e,C,A]]
+            elif not f is None: faces_to_add = [[B,f,A], [f,B,C]]
+        for j, nf in enumerate(faces_to_add):
+            new_faces[start_idx+j] = nf
+            
+    mask_untouched_faces = torch.from_numpy(new_faces_cnt == 0).to(T.device)
+    T_keep = T[mask_untouched_faces]
+    T_new = torch.from_numpy(new_faces).to(T.device).to(T.dtype)
+    V_new = torch.from_numpy(new_vertices).to(V.device).to(V.dtype)
+    
+    return (V, V_new), (T_keep, T_new), mask_untouched_faces
+
     
 def triangle_incenter(V, F):
     # V: (N,3), Fsel: (K,3) selected faces
@@ -111,4 +212,4 @@ def triangle_incenter_subdivide(V:torch.Tensor, F:torch.Tensor, mask:torch.Tenso
     V_new_ind = compute_new_vertex_indices(V, V_created)
     F_created = add_faces_with_triangle_incenter_vertex(F[mask], V_new_ind)
 
-    return (V, V_created), (F[~mask], F_created)
+    return (V, V_created), (F[~mask], F_created), ~mask

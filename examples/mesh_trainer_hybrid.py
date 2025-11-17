@@ -67,9 +67,9 @@ class Config:
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
-    data_factor: int = 3
+    data_factor: int = 4
     # increase data factor at these iterations until we are at 1
-    data_factor_up_steps = [2000, 5_000, 15_000, 24_000]
+    data_factor_up_steps = [5_000, 10_000, 26_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -152,9 +152,9 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
     
     #laplacian regularizer
-    lambda_laplacian_loss = 20.0
+    lambda_laplacian_loss = 40.0
     #normal consistency regularizer
-    lambda_normal_consistency_loss = 4.0
+    lambda_normal_consistency_loss = 1.0
     #edge length regularizer
     lambda_edge_len_loss = 0
     # Opacity regularization
@@ -223,7 +223,7 @@ def create_splats(
     if init_type == "mesh":
         if mesh_path is None or len(mesh_path) == 0: assert False, "Mesh path may not be None or empty"
         mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        return splats.create_surface_splats_from_mesh(mesh_o3d, 1, sh_degree, init_opacity, init_scale, feature_dim, device)
+        return splats.create_surface_splats_from_mesh(mesh_o3d, 3, sh_degree, init_opacity, init_scale, feature_dim, device)
     elif init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -335,10 +335,11 @@ class Runner:
         
         
         if "mesh" in self.splats_dict:
-            self.splats_dict["mesh"].create_optimizers(means_lr=cfg.means_lr * self.scene_scale,
-                                                                            scales_lr=cfg.scales_lr, opacities_lr=cfg.opacities_lr,
-                                                                            quats_lr=cfg.quats_lr, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
-                                                                            batch_size= cfg.batch_size, sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
+            self.splats_dict["mesh"].create_optimizers(means_lr=1e-4,
+                                                    bary_lr = 1e-3,
+                                                    scales_lr=1e-3, opacities_lr=1e-3,
+                                                    quats_lr=1e-3, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
+                                                    batch_size= cfg.batch_size, sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
         
         
         
@@ -677,9 +678,8 @@ class Runner:
         force_fix_geometry_flag = False
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        last_subdivide = None
+        
         for step in pbar:
-            if last_subdivide is None: last_subdivide = step
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -699,8 +699,7 @@ class Runner:
                 if all_factors_good: break
             
             if "mesh" in self.splats_dict:
-                if self.splats_dict["mesh"].do_subdivide(step): last_subdivide = step
-                self.splats_dict["mesh"].fix_geometry((step <= 1000) or force_fix_geometry_flag or (step-last_subdivide)<500)
+                self.splats_dict["mesh"].fix_geometry((step <= 1500) or force_fix_geometry_flag or (step-self.splats_dict["mesh"].last_geometry_update)<100)
                 
             
             for splat in self.splats_dict.values():
@@ -803,14 +802,18 @@ class Runner:
                 exp_scale_factor = (math.log(lamda1)-math.log(lamda0))/(max_steps-first_step)
                 step = min(step, max_steps)
                 return lamda0 * math.exp(exp_scale_factor * (step-first_step))
+            
+            loss_data_term = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda 
 
+            """
             bg = 1.0 - fgmask
             dfloss_alpha = ((alphas - fgmask)**2 * bg).sum()
             tvloss_alpha = self.tvloss(alphas * bg, "l2", reduction=None).sum(dim=-1, keepdim=True).mean()
             den_bg = (bg.numel() - bg.sum()).clamp(min=1)
-            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
+            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 0) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
+            loss_data_term = loss_data_term + alpha_reg
+            """
 
-            loss_data_term = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + alpha_reg
             
             
 
@@ -873,21 +876,21 @@ class Runner:
             
             laplacian_loss = {}
             if cfg.lambda_laplacian_loss > 0.0:
-                if splat_key in self.splats_dict:
-                    for splat_key in ["mesh"]:
-                        laplacian_loss[splats_key] = self.splats_dict[splat_key].laplacian_loss("uniform")
+                for splat_key in ["mesh"]:
+                    if splat_key in self.splats_dict:
+                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("uniform")
                         loss_geometry_term = (
                             loss_geometry_term
-                            + cfg.lambda_laplacian_loss * laplacian_loss[splats_key]
+                            + cfg.lambda_laplacian_loss * laplacian_loss[splat_key]
                         )
                     
 
             loss_data_term.backward(retain_graph=True)
-            if loss_geometry_term != 0.0 and loss_geometry_term.requires_grad:
-                loss_geometry_term.backward(retain_graph=True)
             
             for s in self.splats_dict.values():
                 s.on_loss_grad_computed(step)
+            if loss_geometry_term != 0.0 and loss_geometry_term.requires_grad:
+                loss_geometry_term.backward(retain_graph=True)
             
                 
             loss = loss_data_term + loss_geometry_term
@@ -1039,10 +1042,12 @@ class Runner:
 
             # optimize
             for i, splat in enumerate(self.splats_dict.values()):
+                splat.pre_optimizers_step(step)
                 for optimizer in splat.optimizers.values():
                     if (isinstance(optimizer, SelectiveAdam)): optimizer.step(visibility_mask[i])
                     else: optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                splat.post_optimizers_step(step)
                     
             for optimizer in self.pose_optimizers:
                 optimizer.step()
