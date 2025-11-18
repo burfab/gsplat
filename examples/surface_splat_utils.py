@@ -6,6 +6,7 @@ import pytorch3d.utils
 import torch
 import open3d as o3d
 import numpy as np
+import pytorch3d._C
 
 def sample_barycentric(N:int)->torch.Tensor:
     P = torch.distributions.Dirichlet(torch.tensor([1.0,1.0,1.0]).float())
@@ -177,6 +178,66 @@ def masked_midpoint_subdivide(V,T, mask):
     V_new = torch.from_numpy(new_vertices).to(V.device).to(V.dtype)
     
     return (V, V_new), (T_keep, T_new), mask_untouched_faces
+
+
+def find_closest_face(
+    meshes: pytorch3d.structures.Meshes,
+    pcls: pytorch3d.structures.Pointclouds,
+    min_triangle_area: float = 5e-3
+):
+    """
+    Computes the distance between a pointcloud and a mesh within a batch.
+    Given a pair `(mesh, pcl)` in the batch, we define the distance to be the
+    sum of two distances, namely `point_face(mesh, pcl) + face_point(mesh, pcl)`
+
+    `point_face(mesh, pcl)`: Computes the squared distance of each point p in pcl
+        to the closest triangular face in mesh and averages across all points in pcl
+    `face_point(mesh, pcl)`: Computes the squared distance of each triangular face in
+        mesh to the closest point in pcl and averages across all faces in mesh.
+
+    The above distance functions are applied for all `(mesh, pcl)` pairs in the batch
+    and then averaged across the batch.
+
+    Args:
+        meshes: A Meshes data structure containing N meshes
+        pcls: A Pointclouds data structure containing N pointclouds
+        min_triangle_area: (float, defaulted) Triangles of area less than this
+            will be treated as points/lines.
+
+    Returns:
+        loss: The `point_face(mesh, pcl) + face_point(mesh, pcl)` distance
+            between all `(mesh, pcl)` in a batch averaged across the batch.
+    """
+
+    if len(meshes) != len(pcls):
+        raise ValueError("meshes and pointclouds must be equal sized batches")
+    N = len(meshes)
+    assert N == 1, "Only supports batch size of 1"
+        
+
+    # packed representation for pointclouds
+    points = pcls.points_packed()  # (P, 3)
+    points_first_idx = pcls.cloud_to_packed_first_idx()
+    max_points = pcls.num_points_per_cloud().max().item()
+
+    # packed representation for faces
+    verts_packed = meshes.verts_packed()
+    faces_packed = meshes.faces_packed()
+    tris = verts_packed[faces_packed]  # (T, 3, 3)
+    tris_first_idx = meshes.mesh_to_faces_packed_first_idx()
+
+    # point to face distance: shape (P,)
+    dists, inds = pytorch3d._C.point_face_dist_forward(
+            points,
+            points_first_idx,
+            tris,
+            tris_first_idx,
+            max_points,
+            min_triangle_area,
+        )
+    return dists, inds 
+
+
 
     
 def triangle_incenter(V, F):

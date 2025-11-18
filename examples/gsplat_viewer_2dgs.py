@@ -25,6 +25,8 @@ class GsplatRenderTabState(RenderTabState):
     colormap: Literal[
         "turbo", "viridis", "magma", "inferno", "cividis", "gray"
     ] = "turbo"
+    scale_mod: float = 1.0
+    random_color: bool = False
 
 
 class GsplatViewer(Viewer):
@@ -106,11 +108,13 @@ class GsplatViewer(Viewer):
                     step=1.0,
                     hint="2D radius clip for rendering.",
                 )
-
+                
                 @radius_clip_slider.on_update
                 def _(_) -> None:
                     self.render_tab_state.radius_clip = radius_clip_slider.value
                     self.rerender(_)
+                    
+                    
 
                 eps2d_slider = server.gui.add_number(
                     "2D Epsilon",
@@ -192,6 +196,38 @@ class GsplatViewer(Viewer):
                 def _(_) -> None:
                     self.render_tab_state.colormap = colormap_dropdown.value
                     self.rerender(_)
+                    
+                    
+                scale_mod_slider = server.gui.add_number(
+                    "Scale mod",
+                    initial_value=self.render_tab_state.scale_mod,
+                    min=0.01,
+                    max=2.5,
+                    step=0.01,
+                    hint="Scale mod for rendering.",
+                )
+                
+
+                @scale_mod_slider.on_update
+                def _(_) -> None:
+                    self.render_tab_state.scale_mod = scale_mod_slider.value
+                    self.rerender(_)
+                    
+                    
+                random_color_checkbox = server.gui.add_checkbox(
+                    "Random color",
+                    initial_value=self.render_tab_state.random_color,
+                    disabled=False,
+                    hint="Random color for splats",
+                )
+
+                @random_color_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.random_color = (
+                        random_color_checkbox.value
+                    )
+                    self.rerender(_)
+                    
 
         self._rendering_tab_handles.update(
             {
@@ -205,6 +241,9 @@ class GsplatViewer(Viewer):
                 "normalize_nearfar_checkbox": normalize_nearfar_checkbox,
                 "inverse_checkbox": inverse_checkbox,
                 "colormap_dropdown": colormap_dropdown,
+                #custom controls
+                "random_color_checkbox": random_color_checkbox,
+                "scale_mod_slider": scale_mod_slider,
             }
         )
         super()._populate_rendering_tab()

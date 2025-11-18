@@ -85,10 +85,10 @@ def _update_param_with_optimizer(
             for key in param_state.keys():
                 if key != "step":
                     v = param_state[key]
-                    param_state[key] = optimizer_fn(key, v)
+                    param_state[key] = optimizer_fn(name, key, v)
                 elif key == "step" and not optimizer_step_fn is None:
                     v = param_state[key]
-                    param_state[key] = optimizer_step_fn(key, v)
+                    param_state[key] = optimizer_step_fn(name, key, v)
             optimizer.param_groups[i]["params"] = [new_param]
             optimizer.state[new_param] = param_state
 
@@ -113,7 +113,7 @@ def duplicate(
     def param_fn(name: str, p: Tensor) -> Tensor:
         return torch.nn.Parameter(torch.cat([p, p[sel]]), requires_grad=p.requires_grad)
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         return torch.cat([v, torch.zeros((len(sel), *v.shape[1:]), device=device)])
 
     # update the parameters and the state in the optimizers
@@ -170,7 +170,7 @@ def split(
         p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
         return p_new
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
         return torch.cat([v[rest], v_split])
 
@@ -203,7 +203,7 @@ def remove(
     def param_fn(name: str, p: Tensor) -> Tensor:
         return torch.nn.Parameter(p[sel], requires_grad=p.requires_grad)
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         return v[sel]
 
     # update the parameters and the state in the optimizers
@@ -236,7 +236,7 @@ def reset_opa(
         else:
             raise ValueError(f"Unexpected parameter name: {name}")
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         return torch.zeros_like(v)
 
     # update the parameters and the state in the optimizers
@@ -289,7 +289,7 @@ def relocate(
         p[dead_indices] = p[sampled_idxs]
         return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         v[sampled_idxs] = 0
         return v
 
@@ -331,7 +331,7 @@ def sample_add(
         p_new = torch.cat([p, p[sampled_idxs]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
-    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+    def optimizer_fn(name:str, key: str, v: Tensor) -> Tensor:
         v_new = torch.zeros((len(sampled_idxs), *v.shape[1:]), device=v.device)
         return torch.cat([v, v_new])
 

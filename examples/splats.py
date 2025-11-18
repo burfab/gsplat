@@ -470,6 +470,29 @@ class SurfaceSplats(Splats):
             target_len = torch.median(lmax) 
         return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],target_len)
     
+    
+    def find_nn_splat(self, tri_pts, weights):
+        query_pts = surface_splat_utils.points_from_barycentric(tri_pts,weights)
+        _, nn_idx, _ = pytorch3d.ops.knn_points(query_pts[None,...], self.world_means()[None,...], K=1)
+        assert nn_idx.shape[0] == 1 and nn_idx.shape[2] == 1
+        nn_idx = nn_idx[0,:,0]
+        return nn_idx
+    
+    def get_splat_params_from_indices(self, indices):
+        update = {}
+        update["scales"] = self.scale[indices[:]]
+        update["rotations"] = self.rotations[indices]
+        update["opacities"] = self.opacity[indices]
+        update["bary_logits"] = self.bary_logits[indices]
+        if self._use_sh:
+            update["sh0"] = self.sh0[indices[:]]
+            update["shN"] = self.shN[indices[:]]
+        else:
+            update["features"]= self.features[indices[:]]
+            update["colors"]= self.colors[indices[:]]
+        return update
+    
+    
     @torch.no_grad()
     def face_error_proj_on_normal(self):
         grad = self.strategy_state["vertices_grad"]
@@ -504,12 +527,13 @@ class SurfaceSplats(Splats):
         mask_split = self.face_error_top_q_mask(q,face_error_min_th)
         if mask_split is None: return False
         device = self.vertices.device
-        triangle_index_shift = mask_split.cumsum(0) #to subtract from old triangle indices, as they will be shifted
         
         
         #remove all splats on touched faces
         #create k new splats per face, initialize by nearest splat 
         vertices_new, triangles_new,mask_untouched_faces = surface_splat_utils.masked_midpoint_subdivide(self.vertices, self.triangles, mask_split)
+        triangle_index_shift = (~mask_untouched_faces).cumsum(0) #to subtract from old triangle indices, as they will be shifted
+        
         
         cnt_verts_old = len(vertices_new[0]); cnt_verts_new = len(vertices_new[1]);
         cnt_tris_old = len(triangles_new[0]); cnt_tris_new = len(triangles_new[1]);
@@ -522,56 +546,65 @@ class SurfaceSplats(Splats):
         new_vertices_mask = torch.ones(len(vertices_new), dtype=bool, device=device)
         new_vertices_mask[:cnt_verts_old] = False
         
-        new_faces_mask = torch.ones(len(triangles_new), dtype=bool, device=device)
-        new_faces_mask[:cnt_tris_old] = False
         
         
-        tri_ids_new = torch.where(new_faces_mask)[0].repeat_interleave(k).to(device)
-        tri_pts_new = vertices_new[triangles_new[tri_ids_new]]
-        weights_new = surface_splat_utils.sample_barycentric(len(tri_ids_new)).to(device)
-        query_pts = surface_splat_utils.points_from_barycentric(tri_pts_new,weights_new)
         
-        number_new_splats = len(query_pts)
-        
-        
-        _, nn_idx, _ = pytorch3d.ops.knn_points(query_pts[None,...], self.world_means()[None,...], K=1)
-        assert nn_idx.shape[0] == 1 and nn_idx.shape[2] == 1
-        nn_idx = nn_idx[0,:,0]
-        
+        #the splats to keep
         untouched_splats_mask = (mask_untouched_faces)[self.tri_ids]
+        touched_splats_mask = (~mask_untouched_faces)[self.tri_ids]
         
-        update = {}
-        update["scales"] = self.scale[nn_idx[:]]
-        update["rotations"] = self.rotations[nn_idx]
-        update["opacities"] = self.opacity[nn_idx]
-        update["bary_logits"] = surface_splat_utils.barycentric_to_reduced_parameter_space(weights_new)
-        if self._use_sh:
-            update["sh0"] = self.sh0[nn_idx[:]]
-            update["shN"] = self.shN[nn_idx[:]]
-        else:
-            update["features"]= self.features[nn_idx[:]]
-            update["colors"]= self.colors[nn_idx[:]]
+        #find closest face to query pts
+        query = pytorch3d.structures.Pointclouds(self.world_means()[None,touched_splats_mask,...])
+        mesh_new = pytorch3d.structures.Meshes(vertices_new[None,...],triangles_new[None,...])
+        dist_to_face, ind_face = surface_splat_utils.find_closest_face(mesh_new, query,1e-8)
+        reassign_gaussians_mask = touched_splats_mask.clone()
+        reassign_gaussians_mask[touched_splats_mask] = dist_to_face < self.edge_len_guideline * 1e-3
+        
+        update_reassign_gaussians = {
+            "tri_ids": ind_face,
+            }
+        update_reassign_gaussians["tri_ids"] = ind_face
+        if not torch.any(reassign_gaussians_mask): update_reassign_gaussians = {}
+        keep_splats_mask = torch.logical_or(untouched_splats_mask, reassign_gaussians_mask)
+        
+        tri_ids_to_new_geometry = self.tri_ids-triangle_index_shift[self.tri_ids]
+        if "tri_ids" in update_reassign_gaussians:
+            tri_ids_to_new_geometry[reassign_gaussians_mask] = update_reassign_gaussians["tri_ids"]
+        tri_ids_to_new_geometry = tri_ids_to_new_geometry[keep_splats_mask]
+        
+        no_gaussians_mask = torch.ones(len(triangles_new), dtype=bool, device=device)
+        no_gaussians_mask[tri_ids_to_new_geometry] = False
+        
+        tri_ids_created = torch.where(no_gaussians_mask)[0].repeat_interleave(k).to(device)
+        bary_created = surface_splat_utils.sample_barycentric(len(tri_ids_created)).to(device)
+        number_created_splats = len(tri_ids_created)
+        
+        #find nearest neighbour splat for initialization, but use bary logits from random initialization
+        nn_idx = self.find_nn_splat(vertices_new[triangles_new[tri_ids_created]],bary_created)
+        update = self.get_splat_params_from_indices(nn_idx)
+        update["bary_logits"] = surface_splat_utils.barycentric_to_reduced_parameter_space(bary_created)
+        
+        
+        
+        tri_ids_new = torch.cat((tri_ids_to_new_geometry, tri_ids_created.to(self.tri_ids.device)))
         
         def param_fn(name: str, p: torch.Tensor) -> torch.Tensor:
-            p_new = torch.cat((p[untouched_splats_mask], update[name]))
+            if name in update_reassign_gaussians: p[reassign_gaussians_mask] = update_reassign_gaussians[name]
+            p_new = torch.cat((p[keep_splats_mask], update[name]))
             return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
-        def optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
-            v_new = torch.zeros((number_new_splats, *v.shape[1:]), device=device,dtype=v.dtype)
-            return torch.cat((v[untouched_splats_mask], v_new))
-        
+        def optimizer_fn(name:str, key: str, v: torch.Tensor) -> torch.Tensor:
+            if name in update_reassign_gaussians: v[reassign_gaussians_mask] = 0
+            v_new = torch.zeros((number_created_splats, *v.shape[1:]), device=device,dtype=v.dtype)
+            return torch.cat((v[keep_splats_mask], v_new))
         def param_fn_vertices(name: str, p: torch.Tensor) -> torch.Tensor:
             return torch.nn.Parameter(vertices_new, requires_grad=p.requires_grad)
-
-        def optimizer_fn_vertices(key: str, v: torch.Tensor) -> torch.Tensor:
+        def optimizer_fn_vertices(name:str, key: str, v: torch.Tensor) -> torch.Tensor:
             v_new = torch.zeros((max(0,len(vertices_new)-len(v)), *v.shape[1:]), device=device,dtype=v.dtype)
             return torch.cat((v*0.0,v_new))
-        def optimizer_fn_step_vertices(key: str, v: torch.Tensor) -> torch.Tensor:
+        def optimizer_fn_step_vertices(name:str, key: str, v: torch.Tensor) -> torch.Tensor:
             v[...] = 0.0
             return v
-        
-        
-        
         
         strategy_ops._update_param_with_optimizer(param_fn, optimizer_fn, self.params_dict, self.optimizers,update.keys())
         strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]),optimizer_fn_step_vertices)
@@ -580,7 +613,7 @@ class SurfaceSplats(Splats):
         self.schedulers["vertices"].last_epoch = -1
         self.schedulers["vertices"]._last_lr = self.schedulers["vertices"].base_lrs  
         
-        self.register_buffer("tri_ids", torch.cat(((self.tri_ids-triangle_index_shift[self.tri_ids])[untouched_splats_mask],tri_ids_new.to(device))))
+        self.register_buffer("tri_ids", tri_ids_new)
         self.register_buffer("triangles", triangles_new.to(device))
         
         assert not (self.tri_ids < 0).any()
@@ -620,19 +653,19 @@ class SurfaceSplats(Splats):
         # Base (per face): tangent scales from longest edge, bitangent a fraction,
         # normal is absolute thinness independent of triangle size.
         s_base_face = torch.stack([
-            0.35 * lmax,                # σ_t0
+            0.55 * lmax,                # σ_t0
             0.35 * lmax,          # σ_t1 (slightly smaller than t0)
-            1e-4 * self.edge_len_guideline.expand_as(lmax)  # σ_n (paper-thin)
+            1e-3 * self.edge_len_guideline.expand_as(lmax)  # σ_n (paper-thin)
         ], dim=-1)  # (F,3)
 
         s_base = s_base_face[self.tri_ids]  # (N,3)
 
         # Learnable multiplicative factor: exp(log_range * tanh(raw))
         # raw initialized to 0 => factor = 1
-        log_range = 1.0  # ±1 in log => x∈[e^-1, e^+1] ≈ [0.37, 2.72]
+        log_range = 2.0  # ±1 in log => x∈[e^-1, e^+1] ≈ [0.37, 2.72]
         factor = torch.exp(log_range * torch.atan(self.scale) * (2 / math.pi))  # (N,3)
 
-        s = s_base * factor / 2.0
+        s = s_base * factor / (pow(2.71,log_range)*0.5)
 
         # Numerical floor
         eps = 1e-6 * float(self.edge_len_guideline)
@@ -881,7 +914,7 @@ def create_surface_splats_from_mesh(
     opacity_logits = torch.logit(opacity_init.clamp(1e-4, 1-1e-4))  # (N,)
 
     # scale_logits: start at zeros so exp(scale_logits)=1 → scale = base_scale[tri]
-    scale_logits_init = torch.ones((N_splats,3), dtype=torch.float32) * 10
+    scale_logits_init = torch.ones((N_splats,3), dtype=torch.float32)
     bary_logits = surface_splat_utils.barycentric_to_reduced_parameter_space(weights)
 
 

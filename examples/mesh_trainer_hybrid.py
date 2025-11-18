@@ -1,4 +1,4 @@
-
+import pytorch3d.transforms
 import json
 import math
 import os
@@ -37,7 +37,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import AppearanceOptModule, AppearanceOptModule_ViewAngle, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
 import splats
 
@@ -111,7 +111,7 @@ class Config:
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
-    sh_degree: int = 1
+    sh_degree: int = 3
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
@@ -174,7 +174,7 @@ class Config:
     # Enable appearance optimization. (experimental)
     app_opt: bool = True
     # Appearance embedding dimension
-    app_embed_dim: int = 16
+    app_embed_dim: int = 0#16
     # Learning rate for appearance optimization
     app_opt_lr: float = 1e-3
     # Regularization for appearance optimization as weight decay
@@ -304,7 +304,9 @@ class Runner:
         print("Scene scale:", self.scene_scale)
 
         # Model
-        feature_dim = 32 if cfg.app_opt else None
+        HIGH_RES_FEATURE_DIM = 32
+        LOW_RES_FEATURE_DIM = 16
+        feature_dim = LOW_RES_FEATURE_DIM if cfg.app_opt else None
         self.splats_dict = {}
         self.splats_dict["free"] = create_splats(
             self.parser,
@@ -399,9 +401,15 @@ class Runner:
         self.app_optimizers = []
         if cfg.app_opt:
             assert feature_dim is not None
-            self.app_module = AppearanceOptModule(
-                len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
-            ).to(self.device)
+            if False:
+                self.app_module = AppearanceOptModule(
+                    len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
+                ).to(self.device)
+            else:
+                self.app_module = AppearanceOptModule_ViewAngle(
+                    len(self.trainset), feature_dim, cfg.app_embed_dim
+                ).to(self.device)
+            
             # initialize the last layer to be zero so that the initial output is zero.
             torch.nn.init.zeros_(self.app_module.color_head[-1].weight)
             torch.nn.init.zeros_(self.app_module.color_head[-1].bias)
@@ -438,7 +446,7 @@ class Runner:
             if mask is None:
                 mask = torch.ones_like(x).float()
             l2 = ((x-y)*mask.permute(0,3,1,2).repeat(1,3,1,1))**2
-            mse = l2.mean()
+            mse = l2.sum() / (mask.sum()+1e-6)
             psnr = 10 * torch.log10((max_**2)/mse)
             return psnr
 
@@ -533,29 +541,60 @@ class Runner:
         colors = None
         features = None
         
+        random_color = False
+        scale_mod = 1.0
+        fixed_opacities = False 
+        if "fixed_opacities" in kwargs: fixed_opacities = kwargs.pop("fixed_opacities")
+        if "random_color" in kwargs: random_color = kwargs.pop("random_color")
+        if "scale_mod" in kwargs: scale_mod = kwargs.pop("scale_mod")
+            
+        
         dicts = [self.splats_dict[k].as_renderer_dict() for k in self.splats_dict]
         means = torch.cat([d["means"] for d in dicts])
         quats = torch.cat([d["quats"] for d in dicts])
         scales = torch.cat([d["scales"] for d in dicts])
         opacities = torch.cat([d["opacities"] for d in dicts])
-            
         image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
-            colors = torch.cat([d["colors"] for d in dicts])
-            features = torch.cat([d["features"] for d in dicts])
-            colors = self.app_module(
-                features=features,
-                embed_ids=image_ids,
-                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
-            )
-            colors = colors + colors
-            colors = torch.sigmoid(colors)
+        if not random_color:
+            if self.cfg.app_opt:
+                colors = torch.cat([d["colors"] for d in dicts])
+                features = torch.cat([d["features"] for d in dicts])
+                dirs = torch.nn.functional.normalize(means[None, :, :] - camtoworlds[:, None, :3, 3],dim=-1)
+                normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
+                dirs = dirs * normals[None,:,:]
+                colors = self.app_module(
+                    features=features,
+                    embed_ids=image_ids,
+                    dirs=dirs,
+                    sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                )
+                colors = colors + colors
+                colors = torch.sigmoid(colors)
+            else:
+                sh0 = torch.cat([d["sh0"] for d in dicts])
+                shN = torch.cat([d["shN"] for d in dicts])
+                colors = torch.cat([sh0, shN], 1)  # [N, K, 3]
         else:
-            sh0 = torch.cat([d["sh0"] for d in dicts])
-            shN = torch.cat([d["shN"] for d in dicts])
-            colors = torch.cat([sh0, shN], 1)  # [N, K, 3]
+            def index_to_color(idx):
+                # idx: tensor of shape (N,)
+                x = idx * 0x45d9f3b  # large odd constant
+                x = ((x >> 16) ^ x) * 0x45d9f3b
+                x = ((x >> 16) ^ x)
 
+                # take 3 bytes for RGB
+                r =  (x & 0xFF) / 255.0
+                g = ((x >> 8) & 0xFF) / 255.0
+                b = ((x >> 16) & 0xFF) / 255.0
+                return torch.stack([r, g, b], dim=-1) 
+            colors = index_to_color(torch.arange(0,len(opacities),device=opacities.device))[None,...]
+            kwargs.pop("sh_degree")
+        if scale_mod != 1.0:
+            scales *= scale_mod
+        
+        if fixed_opacities == True:
+            opacities[...] = 1.0
+            
+            
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
@@ -1324,6 +1363,8 @@ class Runner:
             render_mode=RENDER_MODE_MAP[render_tab_state.render_mode],
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
+            random_color=render_tab_state.random_color,
+            scale_mod=render_tab_state.scale_mod
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(info["radii"])
         render_tab_state.rendered_gs_count = (info["radii"] > 0).all(-1).sum().item()

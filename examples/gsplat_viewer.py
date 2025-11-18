@@ -27,6 +27,10 @@ class GsplatRenderTabState(RenderTabState):
     ] = "turbo"
     rasterize_mode: Literal["classic", "antialiased"] = "classic"
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
+    
+    scale_mod: float = 1.0
+    random_color: bool = False
+    fixed_opacities: bool = False
 
 
 class GsplatViewer(Viewer):
@@ -218,6 +222,53 @@ class GsplatViewer(Viewer):
                 def _(_) -> None:
                     self.render_tab_state.camera_model = camera_model_dropdown.value
                     self.rerender(_)
+                    
+                    
+                scale_mod_slider = server.gui.add_number(
+                    "Scale mod",
+                    initial_value=self.render_tab_state.scale_mod,
+                    min=0.01,
+                    max=2.5,
+                    step=0.01,
+                    hint="Scale mod for rendering.",
+                )
+                
+
+                @scale_mod_slider.on_update
+                def _(_) -> None:
+                    self.render_tab_state.scale_mod = scale_mod_slider.value
+                    self.rerender(_)
+                    
+                    
+                random_color_checkbox = server.gui.add_checkbox(
+                    "Random color",
+                    initial_value=self.render_tab_state.random_color,
+                    disabled=False,
+                    hint="Random color for splats",
+                )
+
+                @random_color_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.random_color = (
+                        random_color_checkbox.value
+                    )
+                    self.rerender(_)
+                    
+                fixed_opacities_checkbox = server.gui.add_checkbox(
+                    "Fixed Opacities",
+                    initial_value=self.render_tab_state.fixed_opacities,
+                    disabled=False,
+                    hint="Set opacities to 1.0",
+                )
+
+                @fixed_opacities_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.fixed_opacities = (
+                        fixed_opacities_checkbox.value
+                    )
+                    self.rerender(_)
+                    
+                    
 
         self._rendering_tab_handles.update(
             {
@@ -233,6 +284,10 @@ class GsplatViewer(Viewer):
                 "colormap_dropdown": colormap_dropdown,
                 "rasterize_mode_dropdown": rasterize_mode_dropdown,
                 "camera_model_dropdown": camera_model_dropdown,
+                #custom controls
+                "random_color_checkbox": random_color_checkbox,
+                "fixed_opacities": fixed_opacities_checkbox,
+                "scale_mod_slider": scale_mod_slider,
             }
         )
         super()._populate_rendering_tab()

@@ -48,6 +48,65 @@ class CameraOptModule(torch.nn.Module):
         return torch.matmul(camtoworlds, transform)
 
 
+class AppearanceOptModule_ViewAngle(torch.nn.Module):
+    """Appearance optimization module."""
+
+    def __init__(
+        self,
+        n: int,
+        feature_dim: int,
+        embed_dim: int = 16,
+        mlp_width: int = 64,
+        mlp_depth: int = 2,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.embeds = torch.nn.Embedding(n, embed_dim)
+        layers = []
+        layers.append(
+            torch.nn.Linear(embed_dim + feature_dim + 1, mlp_width)
+        )
+        layers.append(torch.nn.ReLU(inplace=True))
+        for _ in range(mlp_depth - 1):
+            layers.append(torch.nn.Linear(mlp_width, mlp_width))
+            layers.append(torch.nn.ReLU(inplace=True))
+        layers.append(torch.nn.Linear(mlp_width, 3))
+        self.color_head = torch.nn.Sequential(*layers)
+
+    def forward(
+        self, features: Tensor, embed_ids: Tensor, dirs: Tensor, sh_degree: int
+    ) -> Tensor:
+        """Adjust appearance based on embeddings.
+
+        Args:
+            features: (N, feature_dim)
+            embed_ids: (C,)
+            dirs: (C, N, 3)
+
+        Returns:
+            colors: (C, N, 3)
+        """
+        from gsplat.cuda._torch_impl import _eval_sh_bases_fast
+
+        C, N = dirs.shape[:2]
+        # Camera embeddings
+        if embed_ids is None:
+            embeds = torch.zeros(C, self.embed_dim, device=features.device)
+        else:
+            embeds = self.embeds(embed_ids)  # [C, D2]
+        embeds = embeds[:, None, :].expand(-1, N, -1)  # [C, N, D2]
+        # GS features
+        features = features[None, :, :].expand(C, -1, -1)  # [C, N, D1]
+        # View directions
+        angles = dirs.sum(-1,keepdim=True)  # [C, N, 1]
+        # Get colors
+        if self.embed_dim > 0:
+            h = torch.cat([embeds, features, angles], dim=-1)  # [C, N, D1 + D2 + K]
+        else:
+            h = torch.cat([features, angles], dim=-1)
+        colors = self.color_head(h)
+        return colors
+
 class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 
