@@ -460,9 +460,9 @@ class SurfaceSplats(Splats):
                               "splat_normals": splat_normals,
                               }
     
-    def normal_consistency_loss(self):
-        return pytorch3d.loss.mesh_normal_consistency(self.render_buffer["meshes"])
-    def laplacian_loss(self, weight_type="cot"): #cot weights seem to promote slivers/fans
+    def normal_consistency_loss(self, mode="default", **kwargs):
+        return surface_splat_utils.mesh_normal_consistency_with_modes(self.render_buffer["meshes"], mode, **kwargs)
+    def laplacian_loss(self, weight_type="uniform"): #cot weights seem to promote slivers/fans
         return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"],weight_type)
     def edge_loss(self, target_len=None):
         if target_len is None:
@@ -495,10 +495,9 @@ class SurfaceSplats(Splats):
     
     @torch.no_grad()
     def face_error_proj_on_normal(self):
-        grad = self.strategy_state["vertices_grad"]
-        proj_grad = grad[self.triangles] * self.normals()[:,None,...]
+        proj_grad = self.strategy_state["vertices_grad"] * self.render_buffer["meshes"].verts_normals_list()[0]
         rij = torch.linalg.norm(proj_grad, dim=-1)
-        ri = rij.mean(dim=-1)
+        ri = rij[self.triangles].mean(dim=-1)
         return ri
     
     def do_subdivide(self, step):
@@ -540,6 +539,13 @@ class SurfaceSplats(Splats):
         
         vertices_new = torch.cat(vertices_new)
         triangles_new = torch.cat(triangles_new)
+        
+        
+        """
+        M_smoothed = pytorch3d.ops.mesh_filtering.taubin_smoothing(pytorch3d.structures.Meshes(vertices_new[None,...], triangles_new[None,...]))
+        vertices_new = M_smoothed.verts_packed()
+        triangles_new = M_smoothed.faces_packed()
+        """
         
         assert len(triangles_new) >= len(self.triangles)
         
@@ -653,9 +659,9 @@ class SurfaceSplats(Splats):
         # Base (per face): tangent scales from longest edge, bitangent a fraction,
         # normal is absolute thinness independent of triangle size.
         s_base_face = torch.stack([
-            0.55 * lmax,                # σ_t0
-            0.35 * lmax,          # σ_t1 (slightly smaller than t0)
-            1e-3 * self.edge_len_guideline.expand_as(lmax)  # σ_n (paper-thin)
+            0.55 * lmax,
+            0.35 * lmax,
+            1e-3 * self.edge_len_guideline.expand_as(lmax)
         ], dim=-1)  # (F,3)
 
         s_base = s_base_face[self.tri_ids]  # (N,3)

@@ -30,7 +30,7 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     return paths
 
 
-def _resize_image_folder(image_dir: str, tasks, interpolation : int = cv2.INTER_CUBIC) -> str:
+def _resize_image_folder(image_dir: str, tasks, interpolation : int = cv2.INTER_CUBIC, ext=".png") -> str:
     """Resize image folder."""
     for factor, resized_dir in tasks:
         print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
@@ -42,7 +42,7 @@ def _resize_image_folder(image_dir: str, tasks, interpolation : int = cv2.INTER_
         image = None;
         for factor, resized_dir in tasks:
             resized_path = os.path.join(
-                resized_dir, os.path.splitext(image_file)[0] + ".png"
+                resized_dir, os.path.splitext(image_file)[0] + ext
             )
             if os.path.isfile(resized_path): continue
             #lazy load
@@ -199,8 +199,8 @@ class Parser:
                 mask_dir_f_down = os.path.join(os.path.dirname(mask_dir), os.path.basename(mask_dir) + f"_{f_down}")
                 image_tasks.append((f_down, image_dir_f_down))
                 mask_tasks.append((f_down, mask_dir_f_down))
-            _resize_image_folder(colmap_image_dir, image_tasks)
-            _resize_image_folder(colmap_mask_dir, mask_tasks, interpolation=cv2.INTER_CUBIC)
+            _resize_image_folder(colmap_image_dir, image_tasks, ext=".jpeg")
+            _resize_image_folder(colmap_mask_dir, mask_tasks, interpolation=cv2.INTER_CUBIC, ext=".png")
         
         mask_paths_by_factor = {}
         image_paths_by_factor = {}
@@ -391,7 +391,9 @@ class Dataset:
 
     def __len__(self):
         return len(self.indices)
-
+    def get_camtoworld(self, item:int)->torch.Tensor:
+        index = self.indices[item]
+        return torch.from_numpy(self.parser.camtoworlds[index])
     def __getitem__(self, item: int) -> Dict[str, Any]:
         factor = 1 if self.shared_factor is None else self.shared_factor.value
         index = self.indices[item]

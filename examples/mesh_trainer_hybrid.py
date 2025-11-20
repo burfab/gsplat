@@ -15,6 +15,7 @@ import fused_ssim_cuda
 
 from multiprocessing import Value as SMValue
 import cv2
+import surface_splat_utils
 
 import imageio
 import numpy as np
@@ -73,7 +74,7 @@ class Config:
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
-    test_every: int = 100
+    test_every: int = 8
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -131,7 +132,7 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
-    visible_adam: bool = True
+    visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
@@ -152,7 +153,7 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
     
     #laplacian regularizer
-    lambda_laplacian_loss = 40.0
+    lambda_laplacian_loss = 40
     #normal consistency regularizer
     lambda_normal_consistency_loss = 1.0
     #edge length regularizer
@@ -302,6 +303,12 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+        
+
+        with torch.no_grad():
+            self.trainset_view_weights = surface_splat_utils.compute_camera_view_sample_weights(self.trainset, self.scene_scale)
+        
+        
 
         # Model
         HIGH_RES_FEATURE_DIM = 32
@@ -338,8 +345,8 @@ class Runner:
         
         if "mesh" in self.splats_dict:
             self.splats_dict["mesh"].create_optimizers(means_lr=1e-4,
-                                                    bary_lr = 1e-3,
-                                                    scales_lr=1e-3, opacities_lr=1e-3,
+                                                    bary_lr = 1e-2,
+                                                    scales_lr=1e-2, opacities_lr=1e-3,
                                                     quats_lr=1e-3, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
                                                     batch_size= cfg.batch_size, sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
         
@@ -401,7 +408,7 @@ class Runner:
         self.app_optimizers = []
         if cfg.app_opt:
             assert feature_dim is not None
-            if False:
+            if True:
                 self.app_module = AppearanceOptModule(
                     len(self.trainset), feature_dim, cfg.app_embed_dim, cfg.sh_degree
                 ).to(self.device)
@@ -559,9 +566,12 @@ class Runner:
             if self.cfg.app_opt:
                 colors = torch.cat([d["colors"] for d in dicts])
                 features = torch.cat([d["features"] for d in dicts])
-                dirs = torch.nn.functional.normalize(means[None, :, :] - camtoworlds[:, None, :3, 3],dim=-1)
-                normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
-                dirs = dirs * normals[None,:,:]
+                if isinstance(self.app_module,AppearanceOptModule_ViewAngle):
+                    dirs = torch.nn.functional.normalize(means[None, :, :] - camtoworlds[:, None, :3, 3],dim=-1)
+                    normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
+                    dirs = dirs * normals[None,:,:]
+                else:
+                    dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]
                 colors = self.app_module(
                     features=features,
                     embed_ids=image_ids,
@@ -702,10 +712,11 @@ class Runner:
                 )
             )
 
+        train_view_sampler = torch.utils.data.WeightedRandomSampler(self.trainset_view_weights, num_samples=len(self.trainset_view_weights),replacement=True)
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
+            sampler=train_view_sampler,
             batch_size=cfg.batch_size,
-            shuffle=True,
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
@@ -907,7 +918,8 @@ class Runner:
             if cfg.lambda_normal_consistency_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        normal_consistency_loss[splat_key] = self.splats_dict[splat_key].normal_consistency_loss()
+                        sigma = 0.20
+                        normal_consistency_loss[splat_key] = self.splats_dict[splat_key].normal_consistency_loss("edge_aware", sigma=sigma, edge_aware_rational_weight=True)
                         loss_geometry_term = (
                             loss_geometry_term
                             + cfg.lambda_normal_consistency_loss * normal_consistency_loss[splat_key]
@@ -924,15 +936,18 @@ class Runner:
                         )
                     
 
-            loss_data_term.backward(retain_graph=True)
             
-            for s in self.splats_dict.values():
-                s.on_loss_grad_computed(step)
+            """
+            loss_data_term.backward(retain_graph=True)
+            for s in self.splats_dict.values(): s.on_loss_grad_computed(step)
             if loss_geometry_term != 0.0 and loss_geometry_term.requires_grad:
                 loss_geometry_term.backward(retain_graph=True)
+            """
+            loss = loss_data_term + loss_geometry_term
+            loss.backward()
+            for s in self.splats_dict.values(): s.on_loss_grad_computed(step)
             
                 
-            loss = loss_data_term + loss_geometry_term
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
