@@ -47,6 +47,8 @@ from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
+import surface_splat_utils
+
 
 @dataclass
 class Config:
@@ -97,7 +99,7 @@ class Config:
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
-    disable_video: bool = False
+    disable_video: bool = True
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -360,6 +362,11 @@ class Runner:
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+        
+        
+        with torch.no_grad():
+            self.trainset_view_weights = surface_splat_utils.compute_camera_view_sample_weights(self.trainset, self.scene_scale)
+        
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
@@ -472,7 +479,7 @@ class Runner:
             if mask is None:
                 mask = torch.ones_like(x).float()
             l2 = ((x-y)*mask.permute(0,3,1,2).repeat(1,3,1,1))**2
-            mse = l2.mean()
+            mse = l2.sum() / (mask.sum()+1e-6)
             psnr = 10 * torch.log10((max_**2)/mse)
             return psnr
 
@@ -656,10 +663,11 @@ class Runner:
                 )
             )
 
+        train_view_sampler = torch.utils.data.WeightedRandomSampler(self.trainset_view_weights, num_samples=len(self.trainset_view_weights),replacement=True)
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
-            shuffle=True,
+            sampler=train_view_sampler,
             num_workers=4,
             persistent_workers=True,
             pin_memory=True,
@@ -1342,7 +1350,7 @@ if __name__ == "__main__":
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.01,
-                strategy=MCMCStrategy(verbose=True),
+                strategy=MCMCStrategy(verbose=True, cap_max=250_000),
             ),
         ),
     }

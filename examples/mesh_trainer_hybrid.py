@@ -173,7 +173,7 @@ class Config:
     pose_noise: float = 0.0
 
     # Enable appearance optimization. (experimental)
-    app_opt: bool = True
+    app_opt: bool = False
     # Appearance embedding dimension
     app_embed_dim: int = 0#16
     # Learning rate for appearance optimization
@@ -918,7 +918,7 @@ class Runner:
             if cfg.lambda_normal_consistency_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        sigma = 0.20
+                        sigma = 0.50
                         normal_consistency_loss[splat_key] = self.splats_dict[splat_key].normal_consistency_loss("edge_aware", sigma=sigma, edge_aware_rational_weight=True)
                         loss_geometry_term = (
                             loss_geometry_term

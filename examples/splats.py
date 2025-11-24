@@ -507,7 +507,16 @@ class SurfaceSplats(Splats):
         k = q * self.triangles.shape[0]
         k = int(min(self.triangles.shape[0]-1, k))
         if k <= 0: return None
-        ri = self.face_error_proj_on_normal()
+        with torch.enable_grad():
+            V = self.vertices.clone().detach().requires_grad_(True)
+            T = self.triangles.clone()
+            M = pytorch3d.structures.Meshes(V[None,...], T[None,...])
+            loss = surface_splat_utils.mesh_normal_consistency_with_modes(M)
+            loss.backward()
+            ri = torch.linalg.norm(V.grad[T], dim=-1).sum(-1)
+        
+        
+        #ri = self.face_error_proj_on_normal()
         adaptive_th = max(ri.sort(descending=True)[0][k], th_min)
         #NV = self.render_buffer["meshes"].verts_normals_list()[0]
         #NF = self.render_buffer["meshes"].faces_normals_list()[0]
@@ -541,11 +550,6 @@ class SurfaceSplats(Splats):
         triangles_new = torch.cat(triangles_new)
         
         
-        """
-        M_smoothed = pytorch3d.ops.mesh_filtering.taubin_smoothing(pytorch3d.structures.Meshes(vertices_new[None,...], triangles_new[None,...]))
-        vertices_new = M_smoothed.verts_packed()
-        triangles_new = M_smoothed.faces_packed()
-        """
         
         assert len(triangles_new) >= len(self.triangles)
         
@@ -567,7 +571,6 @@ class SurfaceSplats(Splats):
         reassign_gaussians_mask[touched_splats_mask] = dist_to_face < self.edge_len_guideline * 1e-3
         
         update_reassign_gaussians = {
-            "tri_ids": ind_face,
             }
         update_reassign_gaussians["tri_ids"] = ind_face
         if not torch.any(reassign_gaussians_mask): update_reassign_gaussians = {}
