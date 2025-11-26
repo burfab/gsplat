@@ -153,18 +153,20 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
     
     #laplacian regularizer
-    lambda_laplacian_loss = 40
+    lambda_laplacian_loss = 4
     #normal consistency regularizer
     lambda_normal_consistency_loss = 1.0
     #edge length regularizer
-    lambda_edge_len_loss = 0
+    lambda_edge_len_loss = 1.0
+    #edge length regularizer
+    lambda_tilt_loss = 1.0
     # Opacity regularization
     opacity_reg: float = 0.01
     # Scale regularization
     scale_reg: float = 0.01
 
     # Enable camera optimization.
-    pose_opt: bool = True
+    pose_opt: bool = False
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -200,7 +202,7 @@ class Config:
 
     # 3DGUT (uncented transform + eval 3D)
     with_ut: bool = False
-    with_eval3d: bool = False
+    with_eval3d: bool = True
 
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
@@ -224,7 +226,7 @@ def create_splats(
     if init_type == "mesh":
         if mesh_path is None or len(mesh_path) == 0: assert False, "Mesh path may not be None or empty"
         mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        return splats.create_surface_splats_from_mesh(mesh_o3d, 3, sh_degree, init_opacity, init_scale, feature_dim, device)
+        return splats.create_surface_splats_from_mesh(mesh_o3d, 1, sh_degree, init_opacity, init_scale, feature_dim, device)
     elif init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -345,7 +347,7 @@ class Runner:
         
         if "mesh" in self.splats_dict:
             self.splats_dict["mesh"].create_optimizers(means_lr=1e-4,
-                                                    bary_lr = 1e-2,
+                                                    bary_lr = 1e-1,
                                                     scales_lr=1e-2, opacities_lr=1e-3,
                                                     quats_lr=1e-3, sh0_lr=cfg.sh0_lr, shN_lr=cfg.shN_lr,
                                                     batch_size= cfg.batch_size, sparse_grad=cfg.sparse_grad, visible_adam=cfg.visible_adam, max_steps=cfg.max_steps)
@@ -492,7 +494,7 @@ class Runner:
             return grad_x.permute(0, 2, 3, 1), grad_y.permute(0, 2, 3, 1)
 
 
-        def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
+        def tv_loss_sobel(img, fgmask, norm='l1',epsilon=1e-3, reduction='mean'):
             dx, dy = sobel_filter(img)
             if norm == "l1": tv = torch.abs(dx) + torch.abs(dy)
             elif norm == "l2": tv = (dx * dx + dy * dy)
@@ -551,9 +553,11 @@ class Runner:
         random_color = False
         scale_mod = 1.0
         fixed_opacities = False 
+        render_normals = False
         if "fixed_opacities" in kwargs: fixed_opacities = kwargs.pop("fixed_opacities")
         if "random_color" in kwargs: random_color = kwargs.pop("random_color")
         if "scale_mod" in kwargs: scale_mod = kwargs.pop("scale_mod")
+        if "render_normals" in kwargs: render_normals = kwargs.pop("render_normals")
             
         
         dicts = [self.splats_dict[k].as_renderer_dict() for k in self.splats_dict]
@@ -563,27 +567,33 @@ class Runner:
         opacities = torch.cat([d["opacities"] for d in dicts])
         image_ids = kwargs.pop("image_ids", None)
         if not random_color:
-            if self.cfg.app_opt:
-                colors = torch.cat([d["colors"] for d in dicts])
-                features = torch.cat([d["features"] for d in dicts])
-                if isinstance(self.app_module,AppearanceOptModule_ViewAngle):
-                    dirs = torch.nn.functional.normalize(means[None, :, :] - camtoworlds[:, None, :3, 3],dim=-1)
-                    normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
-                    dirs = dirs * normals[None,:,:]
-                else:
-                    dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]
-                colors = self.app_module(
-                    features=features,
-                    embed_ids=image_ids,
-                    dirs=dirs,
-                    sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
-                )
-                colors = colors + colors
-                colors = torch.sigmoid(colors)
+            if render_normals:
+                normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
+                colors = normals * 0.5 + 0.5  # normalize to [0, 1]
+                colors = colors[None,...]
+                kwargs.pop("sh_degree")
             else:
-                sh0 = torch.cat([d["sh0"] for d in dicts])
-                shN = torch.cat([d["shN"] for d in dicts])
-                colors = torch.cat([sh0, shN], 1)  # [N, K, 3]
+                if self.cfg.app_opt:
+                    colors = torch.cat([d["colors"] for d in dicts])
+                    features = torch.cat([d["features"] for d in dicts])
+                    if isinstance(self.app_module,AppearanceOptModule_ViewAngle):
+                        dirs = torch.nn.functional.normalize(means[None, :, :] - camtoworlds[:, None, :3, 3],dim=-1)
+                        normals = pytorch3d.transforms.quaternion_to_matrix(quats)[:,:,2] 
+                        dirs = dirs * normals[None,:,:]
+                    else:
+                        dirs = means[None, :, :] - camtoworlds[:, None, :3, 3]
+                    colors = self.app_module(
+                        features=features,
+                        embed_ids=image_ids,
+                        dirs=dirs,
+                        sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                    )
+                    colors = colors + colors
+                    colors = torch.sigmoid(colors)
+                else:
+                    sh0 = torch.cat([d["sh0"] for d in dicts])
+                    shN = torch.cat([d["shN"] for d in dicts])
+                    colors = torch.cat([sh0, shN], 1)  # [N, K, 3]
         else:
             def index_to_color(idx):
                 # idx: tensor of shape (N,)
@@ -749,7 +759,7 @@ class Runner:
                 if all_factors_good: break
             
             if "mesh" in self.splats_dict:
-                self.splats_dict["mesh"].fix_geometry((step <= 1500) or force_fix_geometry_flag or (step-self.splats_dict["mesh"].last_geometry_update)<100)
+                self.splats_dict["mesh"].fix_geometry((step <= 500) or force_fix_geometry_flag or (step-self.splats_dict["mesh"].last_geometry_update)<100)
                 
             
             for splat in self.splats_dict.values():
@@ -854,15 +864,36 @@ class Runner:
                 return lamda0 * math.exp(exp_scale_factor * (step-first_step))
             
             loss_data_term = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda 
+            def alpha_energy_loss(alpha, fgmask, w_fg=1.0, w_bg=1.0, reduction='mean'):
+                # Penalize spurious alpha in background
+                reduce = {
+                    "mean": lambda x: torch.mean(x),
+                    "sum": lambda x: torch.sum(x),
+                }
+                assert reduction in reduce, f"reduction not in {reduce.keys()}"
+                
+                bg = reduce[reduction]((alpha * (1.0 - fgmask)).abs())
+                # Optionally also keep foreground alpha not too crazy (or push it towards 1)
+                # For low energy in foreground, use |alpha|; for matching mask, use |alpha - fgmask|
+                fg = reduce[reduction]((alpha - fgmask).abs())
+                return w_bg * bg + w_fg * fg
+            
+            def tv_l1_masked(alpha, fgmask):
+                # alpha, fgmask: (B, 1, H, W), fgmask in {0,1} or [0,1]
+                dx = alpha[:, :, :, 1:] - alpha[:, :, :, :-1]
+                dy = alpha[:, :, 1:, :] - alpha[:, :, :-1, :]
 
-            """
-            bg = 1.0 - fgmask
-            dfloss_alpha = ((alphas - fgmask)**2 * bg).sum()
-            tvloss_alpha = self.tvloss(alphas * bg, "l2", reduction=None).sum(dim=-1, keepdim=True).mean()
-            den_bg = (bg.numel() - bg.sum()).clamp(min=1)
-            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 0) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
+                # Crop mask to match dx/dy shapes
+                mask_x = fgmask[:, :, :, 1:] * fgmask[:, :, :, :-1]
+                mask_y = fgmask[:, :, 1:, :] * fgmask[:, :, :-1, :]
+
+                tv_x = (dx.abs() * mask_x).sum() / (mask_x.sum() + 1e-8)
+                tv_y = (dy.abs() * mask_y).sum() / (mask_y.sum() + 1e-8)
+                return tv_x + tv_y 
+ 
+            #tvloss_alpha = self.tvloss(alphas, "l1", reduction="mean")
+            alpha_reg = 0#1e-1 * alpha_energy_loss(alphas, fgmask,reduction="mean") + 1e-2 * tv_l1_masked(alphas,fgmask)
             loss_data_term = loss_data_term + alpha_reg
-            """
 
             
             
@@ -902,13 +933,24 @@ class Runner:
                             + cfg.scale_reg * torch.abs(self.splats_dict[splat_key].world_scales()).mean()
                         )
             
+            
+            tilt_loss = {}
+            if cfg.lambda_tilt_loss > 0.0:
+                for splat_key in ["mesh"]:
+                    if splat_key in self.splats_dict:
+                        tilt_loss[splat_key] = self.splats_dict[splat_key].tilt_loss()
+                        loss_data_term = (
+                           loss_data_term 
+                            + cfg.lambda_tilt_loss * tilt_loss[splat_key]
+                        )
+            
             loss_geometry_term = 0.0
                         
             edge_len_loss = {}
             if cfg.lambda_edge_len_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        edge_len_loss[splat_key] = self.splats_dict[splat_key].edge_loss(target_len=None)
+                        edge_len_loss[splat_key] = self.splats_dict[splat_key].edge_loss()
                         loss_geometry_term = (
                             loss_geometry_term
                             + cfg.lambda_edge_len_loss * edge_len_loss[splat_key]
@@ -918,7 +960,7 @@ class Runner:
             if cfg.lambda_normal_consistency_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        sigma = 0.50
+                        sigma = 0.6
                         normal_consistency_loss[splat_key] = self.splats_dict[splat_key].normal_consistency_loss("edge_aware", sigma=sigma, edge_aware_rational_weight=True)
                         loss_geometry_term = (
                             loss_geometry_term
@@ -929,7 +971,7 @@ class Runner:
             if cfg.lambda_laplacian_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("uniform")
+                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("cot")
                         loss_geometry_term = (
                             loss_geometry_term
                             + cfg.lambda_laplacian_loss * laplacian_loss[splat_key]
@@ -966,18 +1008,22 @@ class Runner:
             #         f"{self.render_dir}/train_rank{self.world_rank}.png",
             #         (canvas * 255).astype(np.uint8),
             #     )
+            
+            extra_losses = {
+                "tilt": tilt_loss,
+                "edge_len": edge_len_loss,
+                "ncloss": normal_consistency_loss,
+                "laploss": laplacian_loss,
+            }
 
             num_GS=int(np.sum([self.splats_dict[k].npoints() for k in self.splats_dict]))
             if cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                if "mesh" in laplacian_loss:
-                    self.writer.add_scalar("train/laploss", laplacian_loss["mesh"].item(), step)
-                if "mesh" in normal_consistency_loss:
-                    self.writer.add_scalar("train/ncloss", normal_consistency_loss["mesh"].item(), step)
-                if "mesh" in edge_len_loss:
-                    self.writer.add_scalar("train/edgeloss", edge_len_loss["mesh"].item(), step)
+                for extra_loss_key in extra_losses:
+                    if "mesh" in extra_losses[extra_loss_key]:
+                        self.writer.add_scalar(f"train/{extra_loss_key}", extra_losses[extra_loss_key]["mesh"].item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar(f"train/num_GS", num_GS, step)
                 self.writer.add_scalar("train/mem", mem, step)
@@ -1379,6 +1425,7 @@ class Runner:
             rasterize_mode=render_tab_state.rasterize_mode,
             camera_model=render_tab_state.camera_model,
             random_color=render_tab_state.random_color,
+            render_normals=render_tab_state.render_normals,
             scale_mod=render_tab_state.scale_mod
         )  # [1, H, W, 3]
         render_tab_state.total_gs_count = len(info["radii"])

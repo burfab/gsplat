@@ -410,6 +410,15 @@ class Dataset:
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         if len(self.parser.mask_paths) > 0:
             fgmask = cv2.imread(self.parser.mask_paths[load_factor][index], cv2.IMREAD_UNCHANGED).squeeze()
+            """
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            eroded = cv2.erode(fgmask, kernel, iterations=1)
+            opened = cv2.morphologyEx(eroded, cv2.MORPH_OPEN, kernel)
+            fgmask = (fgmask*(opened>0)).squeeze()
+            """
+ 
+ 
+ 
         else: fgmask = np.ones((image.shape[0], image.shape[1]), dtype=np.uint8)
 
         if len(params) > 0:

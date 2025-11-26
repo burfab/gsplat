@@ -388,6 +388,7 @@ class SurfaceSplats(Splats):
             "scales":scale_logits.to(device),# (N,3)
             "opacities":opacity_logits.to(device),# (N,)
             "rotations":torch.zeros(N_splats).float().to(device),# (N,)
+            "tilts":torch.zeros((N_splats,2)).float().to(device),# (N,)
         }
         
         # appearance
@@ -410,7 +411,7 @@ class SurfaceSplats(Splats):
         #compute stuff needed for later
         with torch.no_grad():
             self.prepare_render()
-            lmax = self.render_buffer["tri_stats"]["lmax**2"]
+            lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])
             self.edge_len_guideline = torch.median(lmax)
         
         
@@ -425,6 +426,8 @@ class SurfaceSplats(Splats):
     def vertices(self): return self.__get_param_from_dict("vertices")
     @property
     def rotations(self): return self.__get_param_from_dict("rotations")
+    @property
+    def tilts(self): return self.__get_param_from_dict("tilts")
     @property
     def scale(self): return self.__get_param_from_dict("scales")
     @property
@@ -464,11 +467,20 @@ class SurfaceSplats(Splats):
         return surface_splat_utils.mesh_normal_consistency_with_modes(self.render_buffer["meshes"], mode, **kwargs)
     def laplacian_loss(self, weight_type="uniform"): #cot weights seem to promote slivers/fans
         return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"],weight_type)
-    def edge_loss(self, target_len=None):
+    
+    def edge_loss(self):
+        return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],self.edge_len_guideline)
+    
+    
+    def tilt_loss(self):
+        """
         if target_len is None:
             lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])     # (F,)
             target_len = torch.median(lmax) 
         return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],target_len)
+        """
+        return self.tilts.abs().mean()
+    
     
     
     def find_nn_splat(self, tri_pts, weights):
@@ -482,6 +494,7 @@ class SurfaceSplats(Splats):
         update = {}
         update["scales"] = self.scale[indices[:]]
         update["rotations"] = self.rotations[indices]
+        update["tilts"] = self.tilts[indices]
         update["opacities"] = self.opacity[indices]
         update["bary_logits"] = self.bary_logits[indices]
         if self._use_sh:
@@ -507,6 +520,7 @@ class SurfaceSplats(Splats):
         k = q * self.triangles.shape[0]
         k = int(min(self.triangles.shape[0]-1, k))
         if k <= 0: return None
+        """
         with torch.enable_grad():
             V = self.vertices.clone().detach().requires_grad_(True)
             T = self.triangles.clone()
@@ -514,9 +528,19 @@ class SurfaceSplats(Splats):
             loss = surface_splat_utils.mesh_normal_consistency_with_modes(M)
             loss.backward()
             ri = torch.linalg.norm(V.grad[T], dim=-1).sum(-1)
+        """
         
         
         #ri = self.face_error_proj_on_normal()
+        
+        ri = torch.zeros(len(self.triangles),dtype=torch.float32,device="cpu")
+        cnts = torch.zeros(len(self.triangles),dtype=torch.float32,device="cpu")
+        inds = self.tri_ids.detach().cpu()
+        tilts = self.tilts.detach().cpu()
+        for i in range(len(inds)):
+            ri[inds[i]] += tilts[i].abs().sum()
+            cnts+=1
+        ri/=cnts
         adaptive_th = max(ri.sort(descending=True)[0][k], th_min)
         #NV = self.render_buffer["meshes"].verts_normals_list()[0]
         #NF = self.render_buffer["meshes"].faces_normals_list()[0]
@@ -645,27 +669,50 @@ class SurfaceSplats(Splats):
 
 
     def world_quats(self) -> torch.Tensor:
-        n = self.world_normals()
-        t,b = surface_splat_utils.onb_from_normal_frisvad(n) #(F,3),(F,3)
+        n = self.world_normals()  # (F, 3)
+        t, b = surface_splat_utils.onb_from_normal_frisvad(n)  # (F, 3), (F, 3)
+
+        # ---- 1) apply tilt in tangent plane ----
+        # self.tilts: (F, 2) learnable
+        tilt = self.tilts  # (F, 2)
+        tilt_t = tilt[..., 0:1]  # (F, 1)
+        tilt_b = tilt[..., 1:2]  # (F, 1)
+
+        # small-angle update of normal
+        delta = tilt_t * t + tilt_b * b  # (F, 3)
+        n_tilt = torch.nn.functional.normalize(n + delta, dim=-1)  # (F, 3)
+
+        # recompute tangent basis w.r.t tilted normal
+        # project old t to be orthogonal to n_tilt, then renormalize
+        t_ortho = t - (t * n_tilt).sum(-1, keepdim=True) * n_tilt
+        t_ortho = torch.nn.functional.normalize(t_ortho, dim=-1)
+        b_ortho = torch.cross(n_tilt, t_ortho, dim=-1)  # right-handed
+
+        # ---- 2) your twist around the (tilted) normal ----
         c = torch.cos(self.rotations).unsqueeze(-1)
         s = torch.sin(self.rotations).unsqueeze(-1)
-        t_rot =  c * t + s * b
-        b_rot = -s * t + c * b 
-        
-        R = torch.stack([t_rot, b_rot, n], dim=-1)  # (F,3,3)
-        return rotation_matrix_to_quat(R)     # (N,4)
+
+        t_rot =  c * t_ortho + s * b_ortho
+        b_rot = -s * t_ortho + c * b_ortho
+
+        R = torch.stack([t_rot, b_rot, n_tilt], dim=-1)  # (F, 3, 3)
+        return rotation_matrix_to_quat(R)  # (F, 4)
+
 
     def world_scales(self) -> torch.Tensor:
         # Per-face stats
-        lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])     # (F,)
+        l12 = torch.sort(torch.stack((
+            self.render_buffer["tri_stats"]["l1**2"],
+            self.render_buffer["tri_stats"]["l2**2"],
+            self.render_buffer["tri_stats"]["l3**2"],
+                           ),dim=-1),descending=True).values[...,:2].sqrt()
 
         # Base (per face): tangent scales from longest edge, bitangent a fraction,
         # normal is absolute thinness independent of triangle size.
-        s_base_face = torch.stack([
-            0.55 * lmax,
-            0.35 * lmax,
-            1e-3 * self.edge_len_guideline.expand_as(lmax)
-        ], dim=-1)  # (F,3)
+        s_base_face = torch.concatenate([
+            l12,
+            1e-3 * self.edge_len_guideline.expand_as(l12[...,0:1])
+        ],dim=-1)  # (F,3)
 
         s_base = s_base_face[self.tri_ids]  # (N,3)
 
@@ -678,7 +725,7 @@ class SurfaceSplats(Splats):
 
         # Numerical floor
         eps = 1e-6 * float(self.edge_len_guideline)
-        return s.clamp_min(eps)  # (N,3)
+        return s.clamp(min=eps)  # (N,3)
 
 
     def world_opacities(self) -> torch.Tensor:
@@ -711,7 +758,7 @@ class SurfaceSplats(Splats):
             self.strategy_state["vertices_grad"] = torch.zeros_like(self.vertices,requires_grad=False)
             self.strategy_state["vertices_grad_collected_cnt"] = 0
             
-        exp_decay = 0.1
+        exp_decay = 0.03
         with torch.no_grad():
             self.strategy_state["vertices_grad"] = (torch.zeros_like(self.vertices,requires_grad=False) if self.vertices.grad is None else self.vertices.grad) * (exp_decay) + self.strategy_state["vertices_grad"] * (1.0-exp_decay)
             self.strategy_state["vertices_grad_collected_cnt"] += 1
@@ -729,7 +776,7 @@ class SurfaceSplats(Splats):
         else:
             if self.vertices.grad is not None: 
                 torch.nn.utils.clip_grad_norm_(
-                                [self.vertices], self.edge_len_guideline
+                                [self.vertices], 1#self.edge_len_guideline
                             )
             
     def post_optimizers_step(self, step):
@@ -806,6 +853,7 @@ class SurfaceSplats(Splats):
             ("scales",     self.scale,     scales_lr),
             ("opacities",  self.opacity,  opacities_lr),
             ("rotations",  self.rotations,  quats_lr),
+            ("tilts",  self.tilts,  quats_lr),
         ]
 
         if self._use_sh:
@@ -833,15 +881,17 @@ class SurfaceSplats(Splats):
         assert len(self.initial_learning_rates) == 0 and len(self.schedulers) == 0 and len(self.optimizers) == 0
         for (name,tensor,lr) in param_specs: 
             self.initial_learning_rates[name] = lr * math.sqrt(BS)
-            self.optimizers[name] = get_optimizer_class(name)(
-                [{
-                    "params": [tensor],
-                    "lr": self.initial_learning_rates[name],
-                    "name": name,
-                }],
-                eps=1e-15 / math.sqrt(BS),
-                betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            )
+            if name != "vertices" or True:
+                self.optimizers[name] = get_optimizer_class(name)(
+                    [{
+                        "params": [tensor],
+                        "lr": self.initial_learning_rates[name],
+                        "name": name,
+                    }],
+                    eps=1e-15 / math.sqrt(BS),
+                    betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+                )
+            else: self.optimizers[name] = torch.optim.SGD([tensor], lr=self.initial_learning_rates[name])
         
         self.schedulers["vertices"] = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizers["vertices"], gamma=0.01 ** (1.0 / max_steps)

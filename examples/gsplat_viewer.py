@@ -30,6 +30,7 @@ class GsplatRenderTabState(RenderTabState):
     
     scale_mod: float = 1.0
     random_color: bool = False
+    render_normals: bool = False
     fixed_opacities: bool = False
 
 
@@ -240,6 +241,21 @@ class GsplatViewer(Viewer):
                     self.rerender(_)
                     
                     
+                render_normals_checkbox = server.gui.add_checkbox(
+                    "Render Normals",
+                    initial_value=self.render_tab_state.render_normals,
+                    disabled=False,
+                    hint="Use normal as color for splats",
+                )
+
+                @render_normals_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.render_normals = (
+                        render_normals_checkbox.value
+                    )
+                    self.rerender(_)
+                    
+                    
                 random_color_checkbox = server.gui.add_checkbox(
                     "Random color",
                     initial_value=self.render_tab_state.random_color,
@@ -285,6 +301,7 @@ class GsplatViewer(Viewer):
                 "rasterize_mode_dropdown": rasterize_mode_dropdown,
                 "camera_model_dropdown": camera_model_dropdown,
                 #custom controls
+                "render_normals_checkbox": render_normals_checkbox,
                 "random_color_checkbox": random_color_checkbox,
                 "fixed_opacities": fixed_opacities_checkbox,
                 "scale_mod_slider": scale_mod_slider,
