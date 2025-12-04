@@ -25,7 +25,10 @@ import pytorch3d.ops
 
 
 class Splats(nn.Module):
-    
+    def fn_opacities_activation(self,x): return torch.sigmoid(x)
+    def fn_opacities_inverse_activation(self,x): return torch.logit(x)
+    def fn_scales_activation(self,x): return torch.exp(x)
+    def fn_scales_inverse_activation(self,x): return torch.log(x)
     
     def type_str(self) -> str:
         pass
@@ -329,8 +332,6 @@ class FreeSplats(Splats):
 # You already have rgb_to_sh in your codebase. We'll assume it's available.
 # from utils.sh_utils import rgb_to_sh
 
-def rotation_matrix_to_quat(R: torch.Tensor) -> torch.Tensor:
-    return torchtransforms.matrix_to_quaternion(R)
 
 
 class SurfaceSplats(Splats):
@@ -359,8 +360,9 @@ class SurfaceSplats(Splats):
         tri_ids: torch.Tensor,             # (N,)
         triangles : torch.Tensor,          # (F,3)
         vertices: torch.Tensor,            # (V,3)
-        scale_logits: torch.Tensor,        # (N,3)
-        opacity_logits: torch.Tensor,      # (N,)
+        rotations: torch.Tensor,            # (N,4)
+        scale: torch.Tensor,        # (N,3)
+        opacity: torch.Tensor,      # (N,)
         sh0: torch.Tensor,                 # (N,1,3)
         shN: torch.Tensor,                 # (N,K-1,3)
         features: torch.Tensor,
@@ -381,14 +383,18 @@ class SurfaceSplats(Splats):
         
         self._geometry_frozen = False
         
-        N_splats = scale_logits.shape[0]
+        self.register_buffer("tri_ids", tri_ids.to(device))               # (N,)
+        self.register_buffer("triangles", triangles.to(device))               # (N,)
+        
+        normal_shifts = torch.zeros_like(opacity)
+        
         plain_params_dict = {
             "vertices":vertices.to(device),# (V,3)
             "bary_logits":bary_logits.to(device),# (N,3)
-            "scales":scale_logits.to(device),# (N,3)
-            "opacities":opacity_logits.to(device),# (N,)
-            "rotations":torch.zeros(N_splats).float().to(device),# (N,)
-            "tilts":torch.zeros((N_splats,2)).float().to(device),# (N,)
+            "normal_shifts":normal_shifts.to(device),# (N,3)
+            "scales": self.fn_scales_inverse_activation(scale.to(device)),# (N,3)
+            "opacities": self.fn_opacities_inverse_activation(opacity.to(device)),# (N,)
+            "rotations": rotations.to(device),# (N,4)
         }
         
         # appearance
@@ -401,8 +407,6 @@ class SurfaceSplats(Splats):
             plain_params_dict["colors"] = colors.to(device)       # (N,3) logits (like logit(rgb))
 
         # fixed buffers
-        self.register_buffer("tri_ids", tri_ids.to(device))               # (N,)
-        self.register_buffer("triangles", triangles.to(device))               # (N,)
         
         self.params_dict = nn.ParameterDict(plain_params_dict)
         
@@ -410,9 +414,11 @@ class SurfaceSplats(Splats):
         
         #compute stuff needed for later
         with torch.no_grad():
+            meshes = pytorch3d.structures.Meshes(self.vertices.unsqueeze(0), self.triangles.unsqueeze(0))
+            self.scene_scale = meshes.get_bounding_boxes()[0]
+            edge_lenghts = torch.sqrt(surface_splat_utils.get_edge_lengths(meshes, self.triangles))
+            self.edge_len_guideline = torch.median(edge_lenghts)
             self.prepare_render()
-            lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])
-            self.edge_len_guideline = torch.median(lmax)
         
         
         
@@ -423,11 +429,11 @@ class SurfaceSplats(Splats):
     @property
     def bary_logits(self): return self.__get_param_from_dict("bary_logits")
     @property
+    def normal_shifts(self): return self.__get_param_from_dict("normal_shifts")
+    @property
     def vertices(self): return self.__get_param_from_dict("vertices")
     @property
     def rotations(self): return self.__get_param_from_dict("rotations")
-    @property
-    def tilts(self): return self.__get_param_from_dict("tilts")
     @property
     def scale(self): return self.__get_param_from_dict("scales")
     @property
@@ -444,23 +450,33 @@ class SurfaceSplats(Splats):
     
     def prepare_render(self):
         meshes = pytorch3d.structures.Meshes(self.vertices[None,...], self.triangles[None,...])
+        splat_edge_lengths = surface_splat_utils.get_edge_lengths(meshes, self.tri_ids)
+        #splat_edge_lengths_sorted = torch.sort(splat_edge_lengths,dim=-1,descending=True).values[:,:2]
         
         tri_points = self.vertices[self.triangles]
         tri_normals = meshes.verts_normals_list()[0][self.triangles]
         
         tri_stats = surface_splat_utils.compute_tri_stats(tri_points, meshes, True, True)
         bary = surface_splat_utils.barycentric_from_reduced_parameter_space(self.bary_logits)
-        splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary)
-        splat_normals = surface_splat_utils.points_from_barycentric(tri_normals[self.tri_ids], bary)
+        splat_mesh_normals = torch.nn.functional.normalize(surface_splat_utils.points_from_barycentric(tri_normals[self.tri_ids], bary));
+        splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary) + self.normal_shifts.unsqueeze(-1) * splat_mesh_normals
+        
+        splat_opacities = self.fn_opacities_activation(self.opacity)
+        splat_scales = self.fn_scales_activation(self.scale).minimum(splat_edge_lengths)#.clamp_max(self.scene_scale.max() * 1e-2)
+        splat_rotations = self.rotations
         
         
         self.render_buffer = { 
                               "meshes": meshes,
+                              "splat_edge_lenghts": splat_edge_lengths,
                               "tri_points": tri_points,
                               "tri_stats": tri_stats,
                               "bary": bary,
+                              "splat_mesh_normals": splat_mesh_normals,
                               "splat_means": splat_means,
-                              "splat_normals": splat_normals,
+                              "splat_opacities": splat_opacities,
+                              "splat_scales": splat_scales,
+                              "splat_rotations": splat_rotations,
                               }
     
     def normal_consistency_loss(self, mode="default", **kwargs):
@@ -471,16 +487,22 @@ class SurfaceSplats(Splats):
     def edge_loss(self):
         return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],self.edge_len_guideline)
     
+    def regularization_loss(self, lambda_normal_shifts = 10.0, lambda_scale_loss = 10.0, lambda_tilt_loss = 1.0):
+        loss = torch.zeros(1).requires_grad_(True).to(self.vertices.device)
+        if lambda_normal_shifts > 0:
+            normal_shift_loss = self.normal_shifts.abs().mean()
+            loss = loss + normal_shift_loss * lambda_normal_shifts
+        if lambda_scale_loss > 0:
+            splat_edge_lengths_sorted = torch.sort(self.render_buffer["splat_edge_lenghts"].detach(),dim=-1,descending=True).values[:,:2]
+            scale_loss = ((self.world_scales()[...,:2]-splat_edge_lengths_sorted)**2).mean()
+            loss =loss + scale_loss * lambda_scale_loss 
+        if lambda_tilt_loss > 0:
+            tilt_loss = ((1.0-self.splat_cos_angle_to_face()).mean()) 
+            loss = loss + tilt_loss * lambda_tilt_loss
+        
+        return loss
     
-    def tilt_loss(self):
-        """
-        if target_len is None:
-            lmax = torch.sqrt(self.render_buffer["tri_stats"]["lmax**2"])     # (F,)
-            target_len = torch.median(lmax) 
-        return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],target_len)
-        """
-        return self.tilts.abs().mean()
-    
+        
     
     
     def find_nn_splat(self, tri_pts, weights):
@@ -494,9 +516,9 @@ class SurfaceSplats(Splats):
         update = {}
         update["scales"] = self.scale[indices[:]]
         update["rotations"] = self.rotations[indices]
-        update["tilts"] = self.tilts[indices]
         update["opacities"] = self.opacity[indices]
         update["bary_logits"] = self.bary_logits[indices]
+        update["normal_shifts"] = self.normal_shifts[indices]
         if self._use_sh:
             update["sh0"] = self.sh0[indices[:]]
             update["shN"] = self.shN[indices[:]]
@@ -515,6 +537,13 @@ class SurfaceSplats(Splats):
     
     def do_subdivide(self, step):
         return step % 2000 == 0 and step >= 1500 and step <= 20_000
+    
+    def splat_cos_angle_to_face(self):
+        quats = self.world_quats()
+        mesh_normals = self.render_buffer["splat_mesh_normals"]
+        splat_normals = torchtransforms.quaternion_to_matrix(quats)[...,2]
+        cosa = (splat_normals * mesh_normals).sum(-1)
+        return cosa
     
     def face_error_top_q_mask(self, q:float, th_min:float = 0.06):
         k = q * self.triangles.shape[0]
@@ -536,9 +565,9 @@ class SurfaceSplats(Splats):
         ri = torch.zeros(len(self.triangles),dtype=torch.float32,device="cpu")
         cnts = torch.zeros(len(self.triangles),dtype=torch.float32,device="cpu")
         inds = self.tri_ids.detach().cpu()
-        tilts = self.tilts.detach().cpu()
+        cosa = (1.0-self.splat_cos_angle_to_face()).cpu()
         for i in range(len(inds)):
-            ri[inds[i]] += tilts[i].abs().sum()
+            ri[inds[i]] += cosa[i]
             cnts+=1
         ri/=cnts
         adaptive_th = max(ri.sort(descending=True)[0][k], th_min)
@@ -642,7 +671,6 @@ class SurfaceSplats(Splats):
         strategy_ops._update_param_with_optimizer(param_fn, optimizer_fn, self.params_dict, self.optimizers,update.keys())
         strategy_ops._update_param_with_optimizer(param_fn_vertices, optimizer_fn_vertices, self.params_dict, self.optimizers,set(["vertices"]),optimizer_fn_step_vertices)
         
-        self.schedulers["vertices"]
         self.schedulers["vertices"].last_epoch = -1
         self.schedulers["vertices"]._last_lr = self.schedulers["vertices"].base_lrs  
         
@@ -657,79 +685,13 @@ class SurfaceSplats(Splats):
     def npoints(self) -> int: return len(self.tri_ids)
 
     # --- world-space reconstructions ---
-    def world_means(self) -> torch.Tensor:
-        return self.render_buffer["splat_means"]
+    def world_means(self) -> torch.Tensor: return self.render_buffer["splat_means"]
     
-    def world_normals(self) -> torch.Tensor:
-        return self.render_buffer["splat_normals"]
-    
-    
-    def normals(self) -> torch.Tensor:
-        return self.render_buffer["meshes"].faces_normals_list()[0]
+    def world_quats(self) -> torch.Tensor: return self.render_buffer["splat_rotations"]
 
+    def world_scales(self) -> torch.Tensor: return self.render_buffer["splat_scales"] 
 
-    def world_quats(self) -> torch.Tensor:
-        n = self.world_normals()  # (F, 3)
-        t, b = surface_splat_utils.onb_from_normal_frisvad(n)  # (F, 3), (F, 3)
-
-        # ---- 1) apply tilt in tangent plane ----
-        # self.tilts: (F, 2) learnable
-        tilt = self.tilts  # (F, 2)
-        tilt_t = tilt[..., 0:1]  # (F, 1)
-        tilt_b = tilt[..., 1:2]  # (F, 1)
-
-        # small-angle update of normal
-        delta = tilt_t * t + tilt_b * b  # (F, 3)
-        n_tilt = torch.nn.functional.normalize(n + delta, dim=-1)  # (F, 3)
-
-        # recompute tangent basis w.r.t tilted normal
-        # project old t to be orthogonal to n_tilt, then renormalize
-        t_ortho = t - (t * n_tilt).sum(-1, keepdim=True) * n_tilt
-        t_ortho = torch.nn.functional.normalize(t_ortho, dim=-1)
-        b_ortho = torch.cross(n_tilt, t_ortho, dim=-1)  # right-handed
-
-        # ---- 2) your twist around the (tilted) normal ----
-        c = torch.cos(self.rotations).unsqueeze(-1)
-        s = torch.sin(self.rotations).unsqueeze(-1)
-
-        t_rot =  c * t_ortho + s * b_ortho
-        b_rot = -s * t_ortho + c * b_ortho
-
-        R = torch.stack([t_rot, b_rot, n_tilt], dim=-1)  # (F, 3, 3)
-        return rotation_matrix_to_quat(R)  # (F, 4)
-
-
-    def world_scales(self) -> torch.Tensor:
-        # Per-face stats
-        l12 = torch.sort(torch.stack((
-            self.render_buffer["tri_stats"]["l1**2"],
-            self.render_buffer["tri_stats"]["l2**2"],
-            self.render_buffer["tri_stats"]["l3**2"],
-                           ),dim=-1),descending=True).values[...,:2].sqrt()
-
-        # Base (per face): tangent scales from longest edge, bitangent a fraction,
-        # normal is absolute thinness independent of triangle size.
-        s_base_face = torch.concatenate([
-            l12,
-            1e-3 * self.edge_len_guideline.expand_as(l12[...,0:1])
-        ],dim=-1)  # (F,3)
-
-        s_base = s_base_face[self.tri_ids]  # (N,3)
-
-        # Learnable multiplicative factor: exp(log_range * tanh(raw))
-        # raw initialized to 0 => factor = 1
-        log_range = 2.0  # ±1 in log => x∈[e^-1, e^+1] ≈ [0.37, 2.72]
-        factor = torch.exp(log_range * torch.atan(self.scale) * (2 / math.pi))  # (N,3)
-
-        s = s_base * factor / (pow(2.71,log_range)*0.5)
-
-        # Numerical floor
-        eps = 1e-6 * float(self.edge_len_guideline)
-        return s.clamp(min=eps)  # (N,3)
-
-
-    def world_opacities(self) -> torch.Tensor:
-        return torch.sigmoid(self.opacity)  # (N,1)
+    def world_opacities(self) -> torch.Tensor: return self.render_buffer["splat_opacities"]
 
     def as_renderer_dict(self) -> dict:
         d = {
@@ -852,8 +814,8 @@ class SurfaceSplats(Splats):
             ("bary_logits",      self.bary_logits, bary_lr),
             ("scales",     self.scale,     scales_lr),
             ("opacities",  self.opacity,  opacities_lr),
+            ("normal_shifts",  self.normal_shifts,  means_lr),
             ("rotations",  self.rotations,  quats_lr),
-            ("tilts",  self.tilts,  quats_lr),
         ]
 
         if self._use_sh:
@@ -921,27 +883,35 @@ def create_surface_splats_from_mesh(
     - set per-triangle base scale from triangle edge lengths
     - build a SurfaceSplats module
     """
+    mesh_o3d = mesh_o3d.remove_unreferenced_vertices()
 
     verts = torch.from_numpy(np.asarray(mesh_o3d.vertices, dtype=np.float32))   # (V,3)
     faces = torch.from_numpy(np.asarray(mesh_o3d.triangles, dtype=np.int64))   # (F,3)
+    mesh = pytorch3d.structures.Meshes(verts[None,...], faces[None,...])
+    normals = mesh.verts_normals_list()[0]
 
     if mesh_o3d.has_vertex_colors():
         vcols = torch.from_numpy(np.asarray(mesh_o3d.vertex_colors, dtype=np.float32)).float()  # (V,3) in [0,1]
     else:
-        mesh_o3d.compute_vertex_normals()
-        norms = torch.from_numpy(np.asarray(mesh_o3d.vertex_normals, dtype=np.float32)).float()
-        vcols = 0.5 * (norms + 1.0) # random colors
+        vcols = 0.5 * (normals + 1.0) # random colors
 
     Fcount = faces.shape[0]
     N_splats = Fcount * K
     splat_faces = torch.arange(0, Fcount, dtype=torch.int64)
     splat_faces = torch.repeat_interleave(splat_faces, K)
     
+    
     assert splat_faces.shape[0] == N_splats
     
     weights = surface_splat_utils.sample_barycentric(N_splats)
-    points = surface_splat_utils.points_from_barycentric(verts[faces[splat_faces]], weights)
+    splat_means = surface_splat_utils.points_from_barycentric(verts[faces[splat_faces]], weights)
+    splat_mesh_normals = torch.nn.functional.normalize(surface_splat_utils.points_from_barycentric(normals[faces[splat_faces]], weights))
+    
     colors = surface_splat_utils.points_from_barycentric(vcols[faces[splat_faces]], weights)
+    splat_quats = surface_splat_utils.quaternion_from_normal(splat_mesh_normals)
+    splat_edge_lengths = surface_splat_utils.get_edge_lengths(mesh, splat_faces)
+    splat_edge_lengths_sorted = torch.sort(splat_edge_lengths,dim=-1,descending=True).values[:,:2]
+    
     
     # --- build SH coefficients for color ---
     # SH layout: (N, (sh_degree+1)^2, 3)
@@ -968,27 +938,25 @@ def create_surface_splats_from_mesh(
         color_logits_param = torch.logit(colors.cpu().clamp(1e-4, 1-1e-4))  # (N,3)
 
     # --- opacity / scale logits init ---
-    # opacity_logits = logit(init_opacity)
-    opacity_init = torch.full((N_splats,), init_opacity, dtype=torch.float32)
-    opacity_logits = torch.logit(opacity_init.clamp(1e-4, 1-1e-4))  # (N,)
-
-    # scale_logits: start at zeros so exp(scale_logits)=1 → scale = base_scale[tri]
-    scale_logits_init = torch.ones((N_splats,3), dtype=torch.float32)
+    splat_opacities = torch.full((N_splats,), init_opacity, dtype=torch.float32).clamp(1e-4,1-1e-4)
+    splat_scales = torch.hstack((splat_edge_lengths_sorted,torch.full((N_splats,1),1e-7, dtype=torch.float32)))
+    
     bary_logits = surface_splat_utils.barycentric_to_reduced_parameter_space(weights)
 
 
     # --- create SurfaceSplats instance ---
     splats = SurfaceSplats(
-        bary_logits      = bary_logits,          # (N,3)
-        tri_ids          = splat_faces,          # (N,)
-        triangles        = faces,                # (N,3)
-        vertices         = verts,                                   # (F,3)
-        scale_logits     = scale_logits_init,                          # (N,3)
-        opacity_logits   = opacity_logits,                             # (N,)
-        sh0              = sh0,                                        # (N,1,3)
-        shN              = shN,                                        # (N,Ksh-1,3)
-        features         = features_param,                             # (N, Kfeatures)
-        colors           = color_logits_param,                         # (N,3)
+        bary_logits      = bary_logits,          
+        tri_ids          = splat_faces,          
+        triangles        = faces,                
+        vertices         = verts,                                   
+        rotations        = splat_quats,                             
+        scale = splat_scales,                       
+        opacity = splat_opacities,                          
+        sh0              = sh0,                                     
+        shN              = shN,                                     
+        features         = features_param,                          
+        colors           = color_logits_param,                      
         device           = device,
     )
 

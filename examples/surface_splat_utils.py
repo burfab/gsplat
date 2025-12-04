@@ -8,6 +8,8 @@ import open3d as o3d
 import numpy as np
 import pytorch3d._C
 
+def rotation_matrix_to_quat(R: torch.Tensor) -> torch.Tensor:
+    return pytorch3d.transforms.matrix_to_quaternion(R)
 
 def compute_camera_view_sample_weights(dataset, scene_scale):
     cam_centers = torch.zeros((len(dataset),3), dtype=torch.float32)
@@ -74,6 +76,23 @@ def onb_from_normal_frisvad(n: torch.Tensor):
     t = torch.nn.functional.normalize(t, dim=-1)
     b = torch.nn.functional.normalize(b, dim=-1)
     return t, b
+
+def quaternion_from_tangent_frame(t,b,n):
+    R = torch.stack([t, b, n], dim=-1)
+    return rotation_matrix_to_quat(R)
+def quaternion_from_normal(n):
+    t, b = onb_from_normal_frisvad(n)  # (F, 3), (F, 3)
+    return quaternion_from_tangent_frame(t,b,n)
+
+def get_edges(mesh, faces):
+    edges = mesh.edges_packed()[mesh.faces_packed_to_edges_packed()[faces]]
+    return edges
+
+def get_edge_lengths(mesh, faces):
+    edge_verts = mesh.verts_packed()[get_edges(mesh, faces)]
+    edge_dirs = edge_verts[:,:,0,:]-edge_verts[:,:,1,:]
+    return torch.linalg.norm(edge_dirs, dim=1)
+
 
 @torch.no_grad()
 def compute_tri_stats(triangle_points:torch.Tensor, meshes: pytorch3d.structures.Meshes, compute_edge_lengths:bool=True, compute_max_edge_length:bool=True)->dict:

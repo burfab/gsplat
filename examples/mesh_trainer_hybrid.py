@@ -157,7 +157,7 @@ class Config:
     #normal consistency regularizer
     lambda_normal_consistency_loss = 1.0
     #edge length regularizer
-    lambda_edge_len_loss = 1.0
+    lambda_edge_len_loss = 0.0
     #edge length regularizer
     lambda_tilt_loss = 1.0
     # Opacity regularization
@@ -934,15 +934,11 @@ class Runner:
                         )
             
             
-            tilt_loss = {}
-            if cfg.lambda_tilt_loss > 0.0:
-                for splat_key in ["mesh"]:
-                    if splat_key in self.splats_dict:
-                        tilt_loss[splat_key] = self.splats_dict[splat_key].tilt_loss()
-                        loss_data_term = (
-                           loss_data_term 
-                            + cfg.lambda_tilt_loss * tilt_loss[splat_key]
-                        )
+            reg_loss = {}
+            for splat_key in ["mesh"]:
+                if splat_key in self.splats_dict:
+                    reg_loss[splat_key] = self.splats_dict[splat_key].regularization_loss(lambda_tilt_loss = cfg.lambda_tilt_loss)
+                    loss_data_term = (loss_data_term + reg_loss[splat_key])
             
             loss_geometry_term = 0.0
                         
@@ -971,7 +967,7 @@ class Runner:
             if cfg.lambda_laplacian_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("cot")
+                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("uniform")
                         loss_geometry_term = (
                             loss_geometry_term
                             + cfg.lambda_laplacian_loss * laplacian_loss[splat_key]
@@ -1010,7 +1006,7 @@ class Runner:
             #     )
             
             extra_losses = {
-                "tilt": tilt_loss,
+                "reg": reg_loss,
                 "edge_len": edge_len_loss,
                 "ncloss": normal_consistency_loss,
                 "laploss": laplacian_loss,
