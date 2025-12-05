@@ -459,7 +459,7 @@ class SurfaceSplats(Splats):
         tri_stats = surface_splat_utils.compute_tri_stats(tri_points, meshes, True, True)
         bary = surface_splat_utils.barycentric_from_reduced_parameter_space(self.bary_logits)
         splat_mesh_normals = torch.nn.functional.normalize(surface_splat_utils.points_from_barycentric(tri_normals[self.tri_ids], bary));
-        splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary) + self.normal_shifts.unsqueeze(-1) * splat_mesh_normals
+        splat_means = surface_splat_utils.points_from_barycentric(tri_points[self.tri_ids], bary)# + self.normal_shifts.unsqueeze(-1) * splat_mesh_normals
         
         splat_opacities = self.fn_opacities_activation(self.opacity)
         splat_scales = self.fn_scales_activation(self.scale).minimum(splat_edge_lengths)#.clamp_max(self.scene_scale.max() * 1e-2)
@@ -494,10 +494,12 @@ class SurfaceSplats(Splats):
             loss = loss + normal_shift_loss * lambda_normal_shifts
         if lambda_scale_loss > 0:
             splat_edge_lengths_sorted = torch.sort(self.render_buffer["splat_edge_lenghts"].detach(),dim=-1,descending=True).values[:,:2]
-            scale_loss = ((self.world_scales()[...,:2]-splat_edge_lengths_sorted)**2).mean()
+            ri = (self.world_scales()[...,:2]-splat_edge_lengths_sorted).max(dim=-1).values
+            scale_loss = torch.maximum(ri,torch.zeros_like(ri)).mean()
             loss =loss + scale_loss * lambda_scale_loss 
         if lambda_tilt_loss > 0:
-            tilt_loss = ((1.0-self.splat_cos_angle_to_face()).mean()) 
+            ri = ((1.0-self.splat_cos_angle_to_face())) -  0.1
+            tilt_loss = torch.maximum(ri,torch.zeros_like(ri)).mean()
             loss = loss + tilt_loss * lambda_tilt_loss
         
         return loss
