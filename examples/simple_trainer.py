@@ -1,5 +1,6 @@
 import json
 import math
+import open3d as o3d
 import os
 import time
 from collections import defaultdict
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 import ctypes
 
+from headless_renderer import HeadlessRenderer
+from tsdf import TSDF, TSDFArgs
 import fused_ssim
 from torch.amp import autocast
 import fused_ssim_cuda
@@ -30,6 +33,10 @@ from datasets.traj import (
     generate_spiral_path,
 )
 from fused_ssim import fused_ssim
+import pytorch3d.io
+import pytorch3d.ops
+import pytorch3d.structures
+import pytorch3d.transforms
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -66,7 +73,7 @@ class Config:
     # Downsample factor for the dataset
     data_factor: int = 4
     # increase data factor at these iterations until we are at 1
-    data_factor_up_steps = [5000, 15_000]
+    data_factor_up_steps = [9_000, 25_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -91,7 +98,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [70_000, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -117,7 +124,10 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
-
+    #when to start depth map supervision and computation
+    self_supervised_depth_step_start = 10_000
+    #when to refresh depth map
+    self_supervised_depth_refresh_every = 5_000
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
@@ -134,7 +144,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = True
+    antialiased: bool = False
 
     # Use random background for training to discourage transparency
     random_bkgd: bool = True
@@ -183,7 +193,7 @@ class Config:
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
-    depth_lambda: float = 1e-2
+    depth_lambda: float = 1e-1
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
@@ -312,6 +322,62 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
+#STEREO PART
+from gaussian_faces.models.stereo_models_utils import estimate_disparity, get_occlusion_mask, model_disparity_signs, compute_xyz_from_disparity,get_Q_matrix
+from DLNR.core.dlnr import DLNR, DLNRArgs, load_model
+from DLNR.core.utils.utils import InputPadder
+
+def stereo_get_optimial_x_shift(scene_scale, s = 0.07):
+    return s * scene_scale
+
+def stereo_scale_camera_matrix(K, scale_factor = 1.0):
+    K = K.clone()
+    K = K * scale_factor
+    K[2,2] = 1.0
+    return K
+
+def stereo_load_dlnr_model(model_path="/home/fabianb/dev/masterthesis/models/DLNR/pretrained/DLNR_Middlebury.pth"):
+    dlnr_args = DLNRArgs()
+    model = load_model(model_path, dlnr_args)
+    return model, dlnr_args
+
+def stereo_get_x_shifted_c2w(c2w, s):
+    c2w = c2w.clone()
+    R = c2w[:3,:3]
+    tx = torch.tensor([s, 0,0]).to(c2w.dtype).to(c2w.device)
+    tx_cam = R @ tx
+    c2w[:3,3] = c2w[:3,3] + tx_cam
+    return c2w
+
+def stereo_disparity_from_left_right_views(model, dlnr_args, left_image, right_image, iterations=16):
+    with torch.no_grad():
+        L = left_image[None,...].expand((2,*left_image.shape))
+        R = right_image[None,...].expand((2,*right_image.shape))
+        _, disp_lr_rl = estimate_disparity(model, L, R, iterations,model_disparity_signs["DLNR"],["LR", "RL"], dlnr_args.mixed_precision)
+        torch.cuda.synchronize()
+        disp_lr = disp_lr_rl[0].unsqueeze(0)
+        disp_rl = disp_lr_rl[1].unsqueeze(0)
+        mask = get_occlusion_mask(disp_lr.squeeze(), disp_rl.squeeze(), 3) 
+        valid = mask & (disp_lr.squeeze().abs() > 1e-3)
+        disp_for_xyz = disp_lr
+        disp_for_xyz[...,~valid] = 0.0
+        return disp_for_xyz
+
+def stereo_xyz_from_disparity(disp, Q):
+    xyz = compute_xyz_from_disparity(disp, Q.expand(1,-1,-1).to(disp.device).to(disp.dtype))
+    return xyz
+
+def stereo_depth_from_disparity(disp, Q):
+    xyz = stereo_xyz_from_disparity(disp,Q)
+    if len(xyz.shape) == 4:
+        return xyz[:,2,...]
+    elif len(xyz.shape) == 3:
+        return xyz[2,...]
+    assert False
+
+
+#END STEREO PART
+
 class Runner:
     """Engine for training and testing."""
 
@@ -319,7 +385,14 @@ class Runner:
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
-
+        
+        
+        if True:
+            self.stereo_model, self.stereo_model_args = stereo_load_dlnr_model()
+        else:
+            self.stereo_model =None
+            self.stereo_model_args = None
+        
         self.cfg = cfg
         self.world_rank = world_rank
         self.local_rank = local_rank
@@ -618,6 +691,64 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
+    
+    @torch.no_grad()
+    def stereo_compute_depthmap(self, Ks, width, height, c2w, ALPHA_TH=0.75, MAX_DIST_REL_TO_BASELINE = 50):
+        assert len(Ks) == 1 and len(c2w) == 1
+        c2w = c2w[0]
+        baseline = stereo_get_optimial_x_shift(self.scene_scale)
+        c2w_secondary_cam = stereo_get_x_shifted_c2w(c2w, baseline)
+        torch.cuda.synchronize()
+        left_image, alpha_left, _ = self.rasterize_splats(
+            camtoworlds=c2w.unsqueeze(0).cuda(),
+            Ks=Ks.cuda(),
+            width=width,
+            height=height,
+            sh_degree=self.cfg.sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            #masks=masks,
+        )
+        
+        torch.cuda.synchronize()
+        right_image , _, _ = self.rasterize_splats(
+            camtoworlds=c2w_secondary_cam.unsqueeze(0).cuda(),
+            Ks=Ks.cuda(),
+            width=width,
+            height=height,
+            sh_degree=self.cfg.sh_degree,
+            near_plane=self.cfg.near_plane,
+            far_plane=self.cfg.far_plane,
+            #masks=masks,
+        )
+        torch.cuda.synchronize()
+        feats = left_image.clone().permute((0,3,1,2)).clamp(0,1)
+        alpha_left = alpha_left.squeeze(-1).unsqueeze(0)
+        left_image = left_image[0].clamp(0,1) * 255; right_image = right_image[0].clamp(0,1) * 255;
+        left_image = left_image.permute((2,0,1))
+        right_image = right_image.permute((2,0,1))
+        disp = stereo_disparity_from_left_right_views(self.stereo_model, self.stereo_model_args, left_image, right_image)
+        disp[alpha_left < ALPHA_TH] = 0
+        Q = get_Q_matrix(Ks[0].detach().cpu().numpy(), width,height, baseline)
+        feats = left_image.permute((1,2,0)).unsqueeze(0)
+        depth_map = stereo_depth_from_disparity(disp, torch.from_numpy(Q)).unsqueeze(1)
+        assert len(depth_map.shape) == 4 and \
+            depth_map.shape[0] == 1 and \
+            disp.shape == depth_map.shape and \
+            len(feats.shape) == 4 and \
+            feats.shape[0] == 1, "Unsupported dimensions"
+        depth_map = depth_map.squeeze(0); disp = disp.squeeze(0); feats = feats.squeeze(0)
+        depth_map[disp == 0] = 0
+        mask_valid_depth = (baseline*MAX_DIST_REL_TO_BASELINE > depth_map) & (depth_map > 0)
+        depth_map[~mask_valid_depth] = 0
+        return depth_map, feats
+    def depthmap_to_o3d(self,depth_map, feats, depth_scale = 1.0, max_depth = 10_000.0):
+        depth_o3d = o3d.geometry.Image((depth_map.detach().cpu().numpy().squeeze()).astype(np.float32))
+        rgb_o3d = o3d.geometry.Image(feats.detach().cpu().numpy().astype(np.uint8))
+        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(rgb_o3d, depth_o3d, depth_scale=depth_scale, 
+                                                                                depth_trunc=float(max_depth/depth_scale),
+                                                                                convert_rgb_to_intensity=False) 
+        return rgbd_image
 
     def train(self):
         cfg = self.cfg
@@ -677,7 +808,76 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        stereo_depth_maps = {}
+        update_tsdf_mesh = False
+        tsdf_im_freq = 10
+        
+        save_feats = True
         for step in pbar:
+            update_tsdf_mesh = update_tsdf_mesh or \
+                ((step-self.cfg.self_supervised_depth_step_start) % self.cfg.self_supervised_depth_refresh_every == 0)
+            update_tsdf_mesh = self.cfg.self_supervised_depth_step_start <= step and update_tsdf_mesh
+            if update_tsdf_mesh:
+                print("TSDF Integration")
+                tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/256, 2.0,16)
+                tsdf = TSDF(tsdf_args)
+                tsdf.create()
+                with torch.no_grad():
+                    for item in tqdm.tqdm(range(0,len(self.trainset),tsdf_im_freq)):
+                        index = self.trainset.indices[item]
+                        cam_id = self.trainset.parser.camera_ids[index]
+                        min_scale_factor = 2
+                        scale_factor = max(min_scale_factor, self.shared_factor.value)
+                        width,height = self.trainset.parser.imsize_dict[(scale_factor, cam_id)]
+                        c2w = torch.from_numpy(self.trainset.parser.camtoworlds[index]).float().to(device)
+                        Ks = torch.from_numpy(self.trainset.parser.Ks_dict[(scale_factor, cam_id)]).float().to(device)
+                        if len(c2w.shape) == 2: c2w = c2w.unsqueeze(0)
+                        if len(Ks.shape) == 2: Ks = Ks.unsqueeze(0)
+                        if self.cfg.pose_opt:
+                            c2w = self.pose_adjust(c2w, torch.tensor([item],device=device))
+                        stereo_depth,feats = self.stereo_compute_depthmap(Ks, width,height, c2w,ALPHA_TH=0.9)
+                        o3d_rgbd = self.depthmap_to_o3d(stereo_depth, feats, tsdf_args.depth_scale, tsdf_args.max_depth)
+                        tsdf.integrate(o3d_rgbd, np.linalg.inv(c2w.detach().cpu().numpy().squeeze()), Ks.detach().cpu().numpy().squeeze(),False)
+                    
+                    print("Extracting mesh poisson")
+                    mesh = tsdf.extract_mesh_poisson()
+                    o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", mesh)
+                    print("Rendering mesh to depth")
+                    
+                    
+                    #create dummy to support varying widths and heights
+                    renderer = HeadlessRenderer(0,0)
+                    renderer.create()
+                    renderer.add_geometry(mesh)
+                    for item in tqdm.tqdm(range(len(self.trainset))):
+                        index = self.trainset.indices[item]
+                        cam_id = self.trainset.parser.camera_ids[index]
+                        width,height = self.trainset.parser.imsize_dict[(self.shared_factor.value, cam_id)]
+                        c2w = self.trainset.parser.camtoworlds[index].astype(np.float32)
+                        K = self.trainset.parser.Ks_dict[(self.shared_factor.value, cam_id)].astype(np.float32)
+                        
+                        if renderer.width != width or renderer.height != height:
+                            renderer.destroy()
+                            renderer = None
+                            renderer = HeadlessRenderer(width,height)
+                            renderer.create()
+                            renderer.add_geometry(mesh)
+                        
+                        rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w), None, None)
+                        
+                        stereo_depth_file = os.path.join("/tmp/", f"{index}_stereo_depth.pth")
+                        stereo_depth_feats_file = os.path.join("/tmp/", f"{index}_stereo_depth_feats.pth")
+                        stereo_depth_transform_file = os.path.join("/tmp/", f"{index}_stereo_depth_transform.pth")
+                        torch.save(torch.from_numpy(rendered_depth), stereo_depth_file)
+                        torch.save([torch.from_numpy(c2w),torch.from_numpy(K)], stereo_depth_transform_file)
+                        if save_feats: torch.save(torch.from_numpy(rendered_color), stereo_depth_feats_file)
+                        stereo_depth_maps[index] = (stereo_depth_file, step)
+                    
+                    renderer.destroy()
+                    renderer = None
+                update_tsdf_mesh = False
+            
+            
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -708,6 +908,13 @@ class Runner:
 
             total_mask = (masks * fgmask) if masks is not None else fgmask
 
+            assert len(image_ids) == 1
+            stereo_depth_file, stereo_depth_step = (None,-1) if not image_ids.item() in stereo_depth_maps else stereo_depth_maps[image_ids.item()]
+            if not stereo_depth_file is None: 
+                stereo_depth = torch.load(stereo_depth_file)
+                stereo_depth = stereo_depth.to(device)
+                if len(stereo_depth.shape) == 2: stereo_depth = stereo_depth.unsqueeze(0)
+            else: stereo_depth = None
             
             valid_px = total_mask.sum()
             all_px   = total_mask.numel()
@@ -728,7 +935,8 @@ class Runner:
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
-
+            
+            
             # forward
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -739,13 +947,17 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB",
-                masks=masks,
+                render_mode="RGB+ED" if (stereo_depth is not None) or cfg.depth_loss else "RGB",
+                #masks=masks,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+                
+            
+            
+
 
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
@@ -785,6 +997,15 @@ class Runner:
                 (pixels*total_mask).permute(0,3,1,2)
             )) * loss_scale_factor
 
+            stereo_depth_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
+            if stereo_depth is not None:
+                depths_squeezed = depths.squeeze(-1)
+                mask_valid_depth = (stereo_depth > 0)# & (depths_squeezed > 0)
+                sum_valid = mask_valid_depth.sum().item()
+                if sum_valid > 0:
+                    #diff_depth = (stereo_depth[mask_valid_depth] - depths_squeezed[mask_valid_depth])
+                    #stereo_depth_loss = F.l1_loss(stereo_depth[mask_valid_depth], depths_squeezed[mask_valid_depth])
+                    stereo_depth_loss = F.l1_loss(stereo_depth, depths_squeezed)
 
 
             def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
@@ -800,7 +1021,7 @@ class Runner:
             den_bg = (bg.numel() - bg.sum()).clamp(min=1)
             alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
 
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + alpha_reg
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + alpha_reg + cfg.depth_lambda * self.scene_scale * stereo_depth_loss
 
 
             #loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100 * tvloss_alpha) / (np.prod(fgmask.shape) - fgmask.sum())
@@ -858,6 +1079,7 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                self.writer.add_scalar("train/stereoloss", stereo_depth_loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
@@ -998,6 +1220,12 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+                
+            
+            #pcl steps
+            disp_model_steps = []#[3_000, 7_500, 10_000, 15_000, 30_000]
+            if step+1 in disp_model_steps:
+                tsdf(step)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1010,6 +1238,7 @@ class Runner:
             
             if step in [i-1 for i in cfg.data_factor_up_steps]:
                 self.shared_factor.value = max(self.shared_factor.value-1, 1)
+                self.update_tsdf_mesh = True
 
 
             if not cfg.disable_viewer:
@@ -1060,10 +1289,10 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
+                #masks=masks,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1075,8 +1304,8 @@ class Runner:
                 # write images
                 canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                cv2.imwrite(
+                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.jpeg",
                     canvas,
                 )
                 
@@ -1088,7 +1317,7 @@ class Runner:
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p, fgmask))
                 metrics["ssim"].append(fused_ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
+                if self.cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                     metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
@@ -1105,7 +1334,7 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
-            if cfg.use_bilateral_grid:
+            if self.cfg.use_bilateral_grid:
                 print(
                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
@@ -1171,7 +1400,7 @@ class Runner:
         width, height = list(self.parser.imsize_dict.values())[0]
 
         # save to video
-        video_dir = f"{cfg.result_dir}/videos"
+        video_dir = f"{self.cfg.result_dir}/videos"
         os.makedirs(video_dir, exist_ok=True)
         writer = imageio.get_writer(f"{video_dir}/traj_{step}.mp4", fps=30)
         for i in tqdm.trange(len(camtoworlds_all), desc="Rendering trajectory"):
@@ -1183,9 +1412,9 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
                 render_mode="RGB+ED",
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
@@ -1206,7 +1435,7 @@ class Runner:
         print("Running compression...")
         world_rank = self.world_rank
 
-        compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
+        compress_dir = f"{self.cfg.result_dir}/compression/rank{world_rank}"
         os.makedirs(compress_dir, exist_ok=True)
 
         self.compression_method.compress(compress_dir, self.splats)
@@ -1350,7 +1579,7 @@ if __name__ == "__main__":
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.01,
-                strategy=MCMCStrategy(verbose=True, cap_max=250_000),
+                strategy=MCMCStrategy(verbose=True, cap_max=300_000),
             ),
         ),
     }

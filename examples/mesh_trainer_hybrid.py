@@ -93,7 +93,7 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 45_000, 60_000])
+    eval_steps: List[int] = field(default_factory=lambda: [3_000, 7_000, 14_000, 21_000, 30_000, 45_000, 60_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -144,7 +144,7 @@ class Config:
     # LR for Gaussian scale factors
     scales_lr: float = 5e-3
     # LR for alpha blending weights
-    opacities_lr: float = 5e-2
+    opacities_lr: float = 1e-1
     # LR for orientation (quaternions)
     quats_lr: float = 1e-3
     # LR for SH band 0 (brightness)
@@ -153,7 +153,9 @@ class Config:
     shN_lr: float = 2.5e-3 / 20
     
     #laplacian regularizer
-    lambda_laplacian_loss = 4
+    lambda_laplacian_loss = 0
+    #triangle angle regularizer
+    lambda_tri_angle_loss = 5e-2
     #normal consistency regularizer
     lambda_normal_consistency_loss = 1.0
     #edge length regularizer
@@ -201,7 +203,7 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # 3DGUT (uncented transform + eval 3D)
-    with_ut: bool = False
+    with_ut: bool = True
     with_eval3d: bool = True
 
     # Whether use fused-bilateral grid
@@ -214,6 +216,7 @@ def create_splats(
     parser: Parser,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
+    init_pts_per_tri: int = 3,
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
@@ -226,7 +229,7 @@ def create_splats(
     if init_type == "mesh":
         if mesh_path is None or len(mesh_path) == 0: assert False, "Mesh path may not be None or empty"
         mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
-        return splats.create_surface_splats_from_mesh(mesh_o3d, 1, sh_degree, init_opacity, init_scale, feature_dim, device)
+        return splats.create_surface_splats_from_mesh(mesh_o3d, init_pts_per_tri, sh_degree, init_opacity, init_scale, feature_dim, device)
     elif init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -967,10 +970,20 @@ class Runner:
             if cfg.lambda_laplacian_loss > 0.0:
                 for splat_key in ["mesh"]:
                     if splat_key in self.splats_dict:
-                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("uniform")
+                        laplacian_loss[splat_key] = self.splats_dict[splat_key].laplacian_loss("cot")
                         loss_geometry_term = (
                             loss_geometry_term
                             + cfg.lambda_laplacian_loss * laplacian_loss[splat_key]
+                        )
+            
+            tri_angle_loss = {}
+            if cfg.lambda_tri_angle_loss > 0.0:
+                for splat_key in ["mesh"]:
+                    if splat_key in self.splats_dict:
+                        tri_angle_loss[splat_key] = self.splats_dict[splat_key].triangle_angle_loss()
+                        loss_geometry_term = (
+                            loss_geometry_term
+                            + cfg.lambda_tri_angle_loss * tri_angle_loss[splat_key]
                         )
                     
 
@@ -1010,6 +1023,7 @@ class Runner:
                 "edge_len": edge_len_loss,
                 "ncloss": normal_consistency_loss,
                 "laploss": laplacian_loss,
+                "angle_loss": tri_angle_loss,
             }
 
             num_GS=int(np.sum([self.splats_dict[k].npoints() for k in self.splats_dict]))
@@ -1140,9 +1154,14 @@ class Runner:
             for i, splat in enumerate(self.splats_dict.values()):
                 splat.pre_optimizers_step(step)
                 for optimizer in splat.optimizers.values():
-                    if (isinstance(optimizer, SelectiveAdam)): optimizer.step(visibility_mask[i])
-                    else: optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    do_step = True
+                    for p in optimizer.param_groups:
+                        if p['name'] == "vertices":
+                            do_step = (step % 5 == 0)
+                    if do_step:
+                        if (isinstance(optimizer, SelectiveAdam)): optimizer.step(visibility_mask[i])
+                        else: optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
                 splat.post_optimizers_step(step)
                     
             for optimizer in self.pose_optimizers:
@@ -1164,6 +1183,9 @@ class Runner:
                     info=info,
                     packed=cfg.packed,
                 )
+                
+            if step % 1000:
+                for t in ["mesh"]: self.splats_dict[t].save_mesh()
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1238,8 +1260,8 @@ class Runner:
             # write images
             canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
             canvas = (canvas * 255).astype(np.uint8)
-            imageio.imwrite(
-                f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+            cv2.imwrite(
+                f"{self.render_dir}/{stage}_step{step}_{i:04d}.jpeg",
                 canvas,
             )
             

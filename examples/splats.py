@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional, Dict, Tuple
 from gsplat.strategy import ops as strategy_ops
 
@@ -483,6 +484,14 @@ class SurfaceSplats(Splats):
         return surface_splat_utils.mesh_normal_consistency_with_modes(self.render_buffer["meshes"], mode, **kwargs)
     def laplacian_loss(self, weight_type="uniform"): #cot weights seem to promote slivers/fans
         return pytorch3d.loss.mesh_laplacian_smoothing(self.render_buffer["meshes"],weight_type)
+    def triangle_angle_loss(self): 
+        angles = surface_splat_utils.triangle_cos_angles(self.render_buffer["meshes"])
+        target_cos_angle = math.cos(math.pi / 3.0)
+        q = 0.35
+        
+        #return (torch.nn.functional.relu(torch.abs(angles - target_cos_angle) - target_cos_angle*q)).mean()
+        return ((angles - target_cos_angle)**2).mean()
+        
     
     def edge_loss(self):
         return pytorch3d.loss.mesh_edge_loss(self.render_buffer["meshes"],self.edge_len_guideline)
@@ -494,12 +503,12 @@ class SurfaceSplats(Splats):
             loss = loss + normal_shift_loss * lambda_normal_shifts
         if lambda_scale_loss > 0:
             splat_edge_lengths_sorted = torch.sort(self.render_buffer["splat_edge_lenghts"].detach(),dim=-1,descending=True).values[:,:2]
-            ri = (self.world_scales()[...,:2]-splat_edge_lengths_sorted).max(dim=-1).values
-            scale_loss = torch.maximum(ri,torch.zeros_like(ri)).mean()
+            ri = (self.world_scales()[...,:2]-splat_edge_lengths_sorted*0.75).max(dim=-1).values
+            scale_loss = torch.nn.functional.relu(ri).mean()
             loss =loss + scale_loss * lambda_scale_loss 
         if lambda_tilt_loss > 0:
-            ri = ((1.0-self.splat_cos_angle_to_face())) -  0.1
-            tilt_loss = torch.maximum(ri,torch.zeros_like(ri)).mean()
+            ri = ((1.0-self.splat_cos_angle_to_face()))
+            tilt_loss = torch.nn.functional.relu(ri).mean()
             loss = loss + tilt_loss * lambda_tilt_loss
         
         return loss
@@ -759,6 +768,10 @@ class SurfaceSplats(Splats):
         else:
             self._geometry_frozen = False
             opt.param_groups[0]["lr"] = self.initial_learning_rates["vertices"]
+            
+    def save_mesh(self, directory = "/tmp/"):
+        torch.save(self.triangles, os.path.join(directory, "triangles.pyt"));
+        torch.save(self.vertices, os.path.join(directory, "vertices.pyt"));
 
     def step_post_backward(
         self,
@@ -766,8 +779,6 @@ class SurfaceSplats(Splats):
         **kwargs,
     ):
         if self.do_subdivide(step): 
-            torch.save(self.triangles, "/tmp/triangles.pyt");
-            torch.save(self.vertices, "/tmp/vertices.pyt") 
             q = subdivision_options.get("q", 0.02) 
             k = subdivision_options.get("splats_per_tri", 1) 
             face_error_min_th = subdivision_options.get("face_error_min_th", 0.001) 
@@ -776,8 +787,6 @@ class SurfaceSplats(Splats):
             self.strategy_state.pop("vertices_grad")
             self.strategy_state.pop("vertices_grad_collected_cnt")
             torch.cuda.empty_cache()
-            torch.save(self.triangles, "/tmp/triangles_subdived.pyt");
-            torch.save(self.vertices, "/tmp/vertices_subdived.pyt") 
             
         
     def check_sanity(self):

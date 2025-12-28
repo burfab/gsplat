@@ -89,6 +89,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
         psnr = 10 * torch.log10((max_**2)/mse)
         return psnr
     
+    
     def write_image(img, path):
         if img.dim() == 2: img = img.unsqueeze(-1)
         assert img.dim() == 3

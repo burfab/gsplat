@@ -66,6 +66,7 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
     ):
+        self.stereo_depth_maps = {}
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
@@ -394,6 +395,17 @@ class Dataset:
     def get_camtoworld(self, item:int)->torch.Tensor:
         index = self.indices[item]
         return torch.from_numpy(self.parser.camtoworlds[index])
+    
+    def update_depthmap(self, item, depthmap, step, directory):
+        index = self.indices[item]
+        file = os.path.join(directory, f"{index}_stereo_depth.pth")
+        torch.save(depthmap.detach().cpu(), file)
+        self.parser.stereo_depth_maps[index] = (file, step)
+        
+        
+    def set_camtoworld(self, item:int, T: np.array)->torch.Tensor:
+        index = self.indices[item]
+        self.parser.camtoworlds[index] = T
     def __getitem__(self, item: int) -> Dict[str, Any]:
         factor = 1 if self.shared_factor is None else self.shared_factor.value
         index = self.indices[item]
@@ -420,6 +432,8 @@ class Dataset:
  
  
         else: fgmask = np.ones((image.shape[0], image.shape[1]), dtype=np.uint8)
+        
+        
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -446,8 +460,16 @@ class Dataset:
             "image": torch.from_numpy(image).float(),
             "fgmask": torch.from_numpy(fgmask).float().unsqueeze(-1)/255,
             "image_id": item,  # the index of the image in the dataset
-            "factor": factor
+            "factor": factor,
         }
+        
+        if index in self.parser.stereo_depth_maps:
+            stereo_depth_map_file, stereo_depth_map_step = self.parser.stereo_depth_maps[index]
+            stereo_depth_map = torch.load(stereo_depth_map_file)
+            data["stereo_depth"] = stereo_depth_map
+            data["stereo_depth_step"] = stereo_depth_map_step
+        
+        
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
 

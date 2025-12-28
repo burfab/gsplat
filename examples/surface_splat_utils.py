@@ -212,7 +212,50 @@ def masked_midpoint_subdivide(V,T, mask):
     
     return (V, V_new), (T_keep, T_new), mask_untouched_faces
 
+def _cos_angle_between(u: torch.Tensor, v: torch.Tensor):
+    """
+    u, v: (..., 3)
+    returns angles in radians: (...,)
+    """
+    u = torch.nn.functional.normalize(u, dim=-1)
+    v = torch.nn.functional.normalize(v, dim=-1)
+    cos = (u * v).sum(dim=-1)
+    return cos
 
+
+def triangle_cos_angles(meshes: pytorch3d.structures.Meshes):
+    """
+    Encourage all triangle internal angles to be close to 60 degrees (pi/3).
+
+    meshes: PyTorch3D Meshes
+    returns: scalar loss
+    """
+    verts = meshes.verts_packed()   # (sum_V, 3)
+    faces = meshes.faces_packed()   # (sum_F, 3)
+
+    v0 = verts[faces[:, 0]]  # (F, 3)
+    v1 = verts[faces[:, 1]]  # (F, 3)
+    v2 = verts[faces[:, 2]]  # (F, 3)
+
+    # Edges from each vertex
+    e0_1 = v1 - v0  # edge v0->v1
+    e0_2 = v2 - v0  # edge v0->v2
+
+    e1_0 = v0 - v1  # edge v1->v0
+    e1_2 = v2 - v1  # edge v1->v2
+
+    e2_0 = v0 - v2  # edge v2->v0
+    e2_1 = v1 - v2  # edge v2->v1
+
+    # Internal angles at v0, v1, v2
+    cos_a0 = _cos_angle_between(e0_1, e0_2)  # (F,)
+    cos_a1 = _cos_angle_between(e1_0, e1_2)  # (F,)
+    cos_a2 = _cos_angle_between(e2_0, e2_1)  # (F,)
+
+    cos_angles = torch.stack([cos_a0, cos_a1, cos_a2], dim=-1)  # (F, 3)
+    return cos_angles
+
+    return loss
 def mesh_normal_consistency_with_modes(meshes, mode="default",**kwargs):
     r"""
     Computes the normal consistency of each mesh in meshes.
