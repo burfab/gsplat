@@ -126,6 +126,8 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    #how many images to skip when taking stereo pairs for tsdf integration
+    tsdf_im_freq:int=10
     #when to start depth map supervision and computation
     self_supervised_depth_step_start = 10_000
     #when to refresh depth map
@@ -338,10 +340,107 @@ def create_splats_with_optimizers(
     return splats, optimizers
 
 
+def sobel_filter(img):
+    # Convert to (B, C, H, W)
+    img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
+    B, C, H, W = img.shape
+    device = img.device
+    dtype = img.dtype
+
+    # Define Sobel kernels
+    sobel_x = torch.tensor([[-1, 0, 1],
+                            [-2, 0, 2],
+                            [-1, 0, 1]], dtype=dtype, device=device) / 8.0
+
+    sobel_y = torch.tensor([[-1, -2, -1],
+                            [ 0,  0,  0],
+                            [ 1,  2,  1]], dtype=dtype, device=device) / 8.0
+
+    # Reshape to (1, 1, 3, 3)
+    sobel_x = sobel_x.view(1, 1, 3, 3)
+    sobel_y = sobel_y.view(1, 1, 3, 3)
+
+    # Expand to (C, 1, 3, 3) for depthwise conv
+    sobel_x = sobel_x.expand(C, 1, 3, 3)
+    sobel_y = sobel_y.expand(C, 1, 3, 3)
+
+    # Depthwise convolution
+    grad_x = F.conv2d(img, sobel_x, padding=1, groups=C)
+    grad_y = F.conv2d(img, sobel_y, padding=1, groups=C)
+
+    # Return in original NHWC format
+    return grad_x.permute(0, 2, 3, 1), grad_y.permute(0, 2, 3, 1)
+
+
+def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
+    dx, dy = sobel_filter(img)
+    if norm == "l1": tv = torch.abs(dx) + torch.abs(dy)
+    elif norm == "l2": tv = (dx * dx + dy * dy)
+    else: assert False, "Unknown norm"
+
+    if reduction == 'mean':
+        return tv.mean()
+    elif reduction == 'sum':
+        return tv.sum()
+    else:
+        return tv
+    
+def alpha_energy_loss(alpha, fgmask, foreground_loss=False, norm = "l1",reduction='mean'):
+    # Penalize spurious alpha in background
+    reduce = {
+        "mean": lambda x: torch.mean(x),
+        "sum": lambda x: torch.sum(x),
+    }
+    norms = {
+        "l1": lambda x: torch.abs(x),
+        "l2": lambda x: x*x,
+    }
+    assert norm in norms, f"norm not in {norms.keys()}"
+    assert reduction in reduce, f"reduction not in {reduce.keys()}"
+    
+    if foreground_loss:
+        return reduce[reduction](norms[norm](alpha - fgmask) * fgmask)
+    else: 
+        bgmask = (1.0-fgmask)
+        return reduce[reduction](norms[norm](((1.0-alpha) - bgmask) * bgmask))
+
+def tv_loss_masked(alpha, fgmask, norm="l2",reduction = 'mean'):
+    reduce = {
+        "mean": lambda x: torch.mean(x),
+        "sum": lambda x: torch.sum(x),
+    }
+    norms = {
+        "l1": lambda x: torch.abs(x),
+        "l2": lambda x: x*x,
+    }
+    assert norm in norms, f"norm not in {norms.keys()}"
+    assert reduction in reduce, f"reduction not in {reduce.keys()}"
+    # alpha, fgmask: (B, H, W, 1), fgmask in {0,1} or [0,1]
+    dx = alpha[:, :, 1:,:] - alpha[:, :, :-1,:]
+    dy = alpha[:, 1:, :,:] - alpha[:, :-1, :,:]
+
+    # Crop mask to match dx/dy shapes
+    mask_x = fgmask[:, :, 1:, :] * fgmask[:, :, :-1,:]
+    mask_y = fgmask[:, 1:, :, :] * fgmask[:, :-1, :,:]
+
+    tv_x = reduce[reduction](norms[norm](dx) * mask_x) #/ (mask_x.sum() + 1e-8)
+    tv_y = reduce[reduction](norms[norm](dy) * mask_y) #/ (mask_y.sum() + 1e-8)
+    return (tv_x + tv_y)
+
+def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
+    if last_step is not None and last_step < step: return 0
+    if first_step > step: return 0
+    exp_scale_factor = (math.log(lamda1)-math.log(lamda0))/(max_steps-first_step)
+    step = min(step, max_steps)
+    return lamda0 * math.exp(exp_scale_factor * (step-first_step))
+
 #STEREO PART
 from gaussian_faces.models.stereo_models_utils import estimate_disparity, get_occlusion_mask, model_disparity_signs, compute_xyz_from_disparity,get_Q_matrix
 from DLNR.core.dlnr import DLNR, DLNRArgs, load_model
 from DLNR.core.utils.utils import InputPadder
+
+
+
 
 def stereo_get_optimial_x_shift(scene_scale, s = 0.07):
     return s * scene_scale
@@ -395,8 +494,67 @@ def stereo_depth_from_disparity(disp, Q):
 #END STEREO PART
 
 class Runner:
-    """Engine for training and testing."""
+    def tsdf_mesh(self, step, tsdf_im_freq = 10, verbose=True):
+        if verbose: print("TSDF Integration")
+        tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/256, 2.0,16)
+        tsdf = TSDF(tsdf_args)
+        tsdf.create()
+        with torch.no_grad():
+            for item in tqdm.tqdm(range(0,len(self.trainset),tsdf_im_freq)):
+                index = self.trainset.indices[item]
+                cam_id = self.trainset.parser.camera_ids[index]
+                min_scale_factor = 2
+                scale_factor = max(min_scale_factor, self.shared_factor.value)
+                width,height = self.trainset.parser.imsize_dict[(scale_factor, cam_id)]
+                c2w = torch.from_numpy(self.trainset.parser.camtoworlds[index]).float().to(self.device)
+                Ks = torch.from_numpy(self.trainset.parser.Ks_dict[(scale_factor, cam_id)]).float().to(self.device)
+                if len(c2w.shape) == 2: c2w = c2w.unsqueeze(0)
+                if len(Ks.shape) == 2: Ks = Ks.unsqueeze(0)
+                if self.cfg.pose_opt:
+                    c2w = self.pose_adjust(c2w, torch.tensor([item],device=self.device))
+                stereo_depth,feats = self.stereo_compute_depthmap(Ks, width,height, c2w,ALPHA_TH=0.9)
+                o3d_rgbd = self.depthmap_to_o3d(stereo_depth, feats, tsdf_args.depth_scale, tsdf_args.max_depth)
+                tsdf.integrate(o3d_rgbd, np.linalg.inv(c2w.detach().cpu().numpy().squeeze()), Ks.detach().cpu().numpy().squeeze(),False)
+            if verbose: print("Extracting mesh poisson")
+            mesh = tsdf.extract_mesh_poisson()
+            return mesh
+        
+    def render_mesh_to_depth(self, mesh, step, directory="/tmp/",verbose=True, save_color=True):
+        stereo_depth_maps = {}
+        if verbose: print("Rendering mesh to depth")
+        #create dummy to support varying widths and heights
+        renderer = HeadlessRenderer(0,0)
+        renderer.create()
+        renderer.add_geometry(mesh)
+        for item in tqdm.tqdm(range(len(self.trainset))):
+            index = self.trainset.indices[item]
+            cam_id = self.trainset.parser.camera_ids[index]
+            width,height = self.trainset.parser.imsize_dict[(self.shared_factor.value, cam_id)]
+            c2w = self.trainset.parser.camtoworlds[index].astype(np.float32)
+            K = self.trainset.parser.Ks_dict[(self.shared_factor.value, cam_id)].astype(np.float32)
+            
+            if renderer.width != width or renderer.height != height:
+                renderer.destroy()
+                renderer = None
+                renderer = HeadlessRenderer(width,height)
+                renderer.create()
+                renderer.add_geometry(mesh)
+            
+            rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w), None, None)
+            
+            stereo_depth_file = os.path.join(directory, f"{index}_stereo_depth.pth")
+            stereo_depth_feats_file = os.path.join(directory, f"{index}_stereo_depth_feats.pth")
+            stereo_depth_transform_file = os.path.join(directory, f"{index}_stereo_depth_transform.pth")
+            torch.save(torch.from_numpy(rendered_depth), stereo_depth_file)
+            torch.save([torch.from_numpy(c2w),torch.from_numpy(K)], stereo_depth_transform_file)
+            if save_color: torch.save(torch.from_numpy(rendered_color), stereo_depth_feats_file)
+            stereo_depth_maps[index] = (stereo_depth_file, step)
+        
+        renderer.destroy()
+        renderer = None
+        return stereo_depth_maps
 
+    """Engine for training and testing."""
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
@@ -581,53 +739,6 @@ class Runner:
 
         # Losses & Metrics.
         self.psnr = maskedPSNR
-
-        def sobel_filter(img):
-            # Convert to (B, C, H, W)
-            img = img.permute(0, 3, 1, 2)  # NHWC -> NCHW
-            B, C, H, W = img.shape
-            device = img.device
-            dtype = img.dtype
-
-            # Define Sobel kernels
-            sobel_x = torch.tensor([[-1, 0, 1],
-                                    [-2, 0, 2],
-                                    [-1, 0, 1]], dtype=dtype, device=device) / 8.0
-
-            sobel_y = torch.tensor([[-1, -2, -1],
-                                    [ 0,  0,  0],
-                                    [ 1,  2,  1]], dtype=dtype, device=device) / 8.0
-
-            # Reshape to (1, 1, 3, 3)
-            sobel_x = sobel_x.view(1, 1, 3, 3)
-            sobel_y = sobel_y.view(1, 1, 3, 3)
-
-            # Expand to (C, 1, 3, 3) for depthwise conv
-            sobel_x = sobel_x.expand(C, 1, 3, 3)
-            sobel_y = sobel_y.expand(C, 1, 3, 3)
-
-            # Depthwise convolution
-            grad_x = F.conv2d(img, sobel_x, padding=1, groups=C)
-            grad_y = F.conv2d(img, sobel_y, padding=1, groups=C)
-
-            # Return in original NHWC format
-            return grad_x.permute(0, 2, 3, 1), grad_y.permute(0, 2, 3, 1)
-
-
-        def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
-            dx, dy = sobel_filter(img)
-            if norm == "l1": tv = torch.abs(dx) + torch.abs(dy)
-            elif norm == "l2": tv = (dx * dx + dy * dy)
-            else: assert False, "Unknown norm"
-
-            if reduction == 'mean':
-                return tv.mean()
-            elif reduction == 'sum':
-                return tv.sum()
-            else:
-                return tv
-            
-        self.tvloss = tv_loss_sobel
 
 
         if cfg.lpips_net == "alex":
@@ -875,71 +986,14 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         stereo_depth_maps = {}
         update_tsdf_mesh = False
-        tsdf_im_freq = 10
-        
-        save_feats = True
         for step in pbar:
             update_tsdf_mesh = update_tsdf_mesh or \
                 ((step-self.cfg.self_supervised_depth_step_start) % self.cfg.self_supervised_depth_refresh_every == 0)
             update_tsdf_mesh = self.cfg.self_supervised_depth_step_start <= step and update_tsdf_mesh
             if update_tsdf_mesh:
-                print("TSDF Integration")
-                tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/256, 2.0,16)
-                tsdf = TSDF(tsdf_args)
-                tsdf.create()
-                with torch.no_grad():
-                    for item in tqdm.tqdm(range(0,len(self.trainset),tsdf_im_freq)):
-                        index = self.trainset.indices[item]
-                        cam_id = self.trainset.parser.camera_ids[index]
-                        min_scale_factor = 2
-                        scale_factor = max(min_scale_factor, self.shared_factor.value)
-                        width,height = self.trainset.parser.imsize_dict[(scale_factor, cam_id)]
-                        c2w = torch.from_numpy(self.trainset.parser.camtoworlds[index]).float().to(device)
-                        Ks = torch.from_numpy(self.trainset.parser.Ks_dict[(scale_factor, cam_id)]).float().to(device)
-                        if len(c2w.shape) == 2: c2w = c2w.unsqueeze(0)
-                        if len(Ks.shape) == 2: Ks = Ks.unsqueeze(0)
-                        if self.cfg.pose_opt:
-                            c2w = self.pose_adjust(c2w, torch.tensor([item],device=device))
-                        stereo_depth,feats = self.stereo_compute_depthmap(Ks, width,height, c2w,ALPHA_TH=0.9)
-                        o3d_rgbd = self.depthmap_to_o3d(stereo_depth, feats, tsdf_args.depth_scale, tsdf_args.max_depth)
-                        tsdf.integrate(o3d_rgbd, np.linalg.inv(c2w.detach().cpu().numpy().squeeze()), Ks.detach().cpu().numpy().squeeze(),False)
-                    
-                    print("Extracting mesh poisson")
-                    mesh = tsdf.extract_mesh_poisson()
-                    o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", mesh)
-                    print("Rendering mesh to depth")
-                    
-                    
-                    #create dummy to support varying widths and heights
-                    renderer = HeadlessRenderer(0,0)
-                    renderer.create()
-                    renderer.add_geometry(mesh)
-                    for item in tqdm.tqdm(range(len(self.trainset))):
-                        index = self.trainset.indices[item]
-                        cam_id = self.trainset.parser.camera_ids[index]
-                        width,height = self.trainset.parser.imsize_dict[(self.shared_factor.value, cam_id)]
-                        c2w = self.trainset.parser.camtoworlds[index].astype(np.float32)
-                        K = self.trainset.parser.Ks_dict[(self.shared_factor.value, cam_id)].astype(np.float32)
-                        
-                        if renderer.width != width or renderer.height != height:
-                            renderer.destroy()
-                            renderer = None
-                            renderer = HeadlessRenderer(width,height)
-                            renderer.create()
-                            renderer.add_geometry(mesh)
-                        
-                        rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w), None, None)
-                        
-                        stereo_depth_file = os.path.join("/tmp/", f"{index}_stereo_depth.pth")
-                        stereo_depth_feats_file = os.path.join("/tmp/", f"{index}_stereo_depth_feats.pth")
-                        stereo_depth_transform_file = os.path.join("/tmp/", f"{index}_stereo_depth_transform.pth")
-                        torch.save(torch.from_numpy(rendered_depth), stereo_depth_file)
-                        torch.save([torch.from_numpy(c2w),torch.from_numpy(K)], stereo_depth_transform_file)
-                        if save_feats: torch.save(torch.from_numpy(rendered_color), stereo_depth_feats_file)
-                        stereo_depth_maps[index] = (stereo_depth_file, step)
-                    
-                    renderer.destroy()
-                    renderer = None
+                mesh = self.tsdf_mesh(step, cfg.tsdf_im_freq)
+                o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", mesh)
+                stereo_depth_maps = self.render_mesh_to_depth(mesh, step)
                 update_tsdf_mesh = False
             
             
@@ -1055,12 +1109,11 @@ class Runner:
 
             # compute photometric loss only on foreground
             # === photometric on foreground only ===
-            l1loss   = F.l1_loss(colors[total_mask.bool().expand_as(colors)], 
-                                pixels[total_mask.bool().expand_as(pixels)])
+            l1loss   = F.l1_loss(colors, pixels)
             ssimloss = (1.0 - fused_ssim(
-                (colors*total_mask).permute(0,3,1,2), 
-                (pixels*total_mask).permute(0,3,1,2)
-            )) * loss_scale_factor
+                colors.permute(0,3,1,2), 
+                pixels.permute(0,3,1,2)
+            )) 
 
             stereo_depth_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
             if stereo_depth is not None:
@@ -1076,12 +1129,6 @@ class Runner:
                     stereo_depth_loss = F.l1_loss(disp, disp_gt)
 
 
-            def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
-                if last_step is not None and last_step < step: return 0
-                if first_step > step: return 0
-                exp_scale_factor = (math.log(lamda1)-math.log(lamda0))/(max_steps-first_step)
-                step = min(step, max_steps)
-                return lamda0 * math.exp(exp_scale_factor * (step-first_step))
             
             normal_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
             normal_lambda = 0
@@ -1112,11 +1159,9 @@ class Runner:
             
             
 
-            bg = 1.0 - fgmask
-            dfloss_alpha = ((alphas - fgmask)**2 * bg).sum()
-            tvloss_alpha = self.tvloss(alphas * bg, "l2", reduction=None).sum(dim=-1, keepdim=True).mean()
-            den_bg = (bg.numel() - bg.sum()).clamp(min=1)
-            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + 100*tvloss_alpha) / den_bg
+            dfloss_alpha =  alpha_energy_loss(alphas, fgmask, foreground_loss=False, norm="l1")
+            tvloss_alpha = tv_loss_masked(alphas, fgmask, norm="l2")
+            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + tvloss_alpha) #/ den_bg
 
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + \
                 alpha_reg + \
@@ -1166,6 +1211,8 @@ class Runner:
                 self.writer.add_scalar("train/stereoloss", stereo_depth_loss.item(), step)
                 self.writer.add_scalar("train/distloss", dist_loss.item(), step)
                 self.writer.add_scalar("train/normalloss", normal_loss.item(), step)
+                self.writer.add_scalar("train/alpha_tvloss", tvloss_alpha.item(), step)
+                self.writer.add_scalar("train/alpha_data_loss", dfloss_alpha.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.use_bilateral_grid:
@@ -1306,11 +1353,6 @@ class Runner:
                 assert_never(self.cfg.strategy)
                 
             
-            #pcl steps
-            disp_model_steps = []#[3_000, 7_500, 10_000, 15_000, 30_000]
-            if step+1 in disp_model_steps:
-                tsdf(step)
-
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
@@ -1337,6 +1379,10 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        mesh = self.tsdf_mesh(max_steps-1, cfg.tsdf_im_freq)
+        o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{max_steps-1}.ply", mesh)
+
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1612,6 +1658,10 @@ class Runner:
             renders = render_normals.cpu().numpy()
         elif render_tab_state.render_mode == "dist":
             dist = render_distort[0,..., 0:1] 
+            dist = dist/max(dist.max(),1e-7)
+            dist = torch.clip(dist, 0, 1)
+            if render_tab_state.inverse:
+                dist = 1 - dist
             renders = (
                 apply_float_colormap(dist, render_tab_state.colormap).cpu().numpy()
             )
@@ -1685,7 +1735,7 @@ if __name__ == "__main__":
                 init_opa=0.5,
                 init_scale=0.1,
                 opacity_reg=0.01,
-                scale_reg=0.01,
+                scale_reg=0.05,
                 strategy=MCMCStrategy(verbose=True, cap_max=300_000),
             ),
         ),

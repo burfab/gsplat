@@ -990,12 +990,11 @@ class Runner:
 
             # compute photometric loss only on foreground
             # === photometric on foreground only ===
-            l1loss   = F.l1_loss(colors[total_mask.bool().expand_as(colors)], 
-                                pixels[total_mask.bool().expand_as(pixels)])
+            l1loss   = F.l1_loss(colors, pixels)
             ssimloss = (1.0 - fused_ssim(
-                (colors*total_mask).permute(0,3,1,2), 
-                (pixels*total_mask).permute(0,3,1,2)
-            )) * loss_scale_factor
+                (colors).permute(0,3,1,2), 
+                (pixels).permute(0,3,1,2)
+            )) #* loss_scale_factor
 
             stereo_depth_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
             if stereo_depth is not None:
