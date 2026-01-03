@@ -29,6 +29,26 @@ def _get_rel_paths(path_dir: str) -> List[str]:
             paths.append(os.path.relpath(os.path.join(dp, f), path_dir))
     return paths
 
+def _undistort_image_folder(image_dir: str, tasks, map_x_by_factor, map_y_by_factor, interpolation : int = cv2.INTER_CUBIC, ext=".png") -> str:
+    assert len(tasks) == len(map_x_by_factor), "Tasks and map length must match, otherwise we have multiple camera ids"
+    """Resize image folder."""
+    for factor, target_dir in tasks:
+        print(f"Undistorting images and scaling by {factor} x from {image_dir} to {target_dir}.")
+        os.makedirs(target_dir, exist_ok=True)
+
+    image_files = _get_rel_paths(image_dir)
+    for image_file in tqdm(image_files):
+        image_path = os.path.join(image_dir, image_file)
+        image = None;
+        for factor, target_dir in tasks:
+            target_path = os.path.join(
+                target_dir, os.path.splitext(image_file)[0] + ext
+            )
+            if os.path.isfile(target_path): continue
+            #lazy load
+            if image is None: image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            undistorted_image = cv2.remap(image, map_x_by_factor[(factor,1)], map_y_by_factor[(factor,1)], interpolation)
+            cv2.imwrite(target_path, undistorted_image)
 
 def _resize_image_folder(image_dir: str, tasks, interpolation : int = cv2.INTER_CUBIC, ext=".png") -> str:
     """Resize image folder."""
@@ -192,30 +212,6 @@ class Parser:
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
 
-        if factor > 1:
-            mask_tasks = []
-            image_tasks = []
-            for f_down in range(2,factor+1):
-                image_dir_f_down = os.path.join(os.path.dirname(image_dir), os.path.basename(image_dir) + f"_{f_down}")
-                mask_dir_f_down = os.path.join(os.path.dirname(mask_dir), os.path.basename(mask_dir) + f"_{f_down}")
-                image_tasks.append((f_down, image_dir_f_down))
-                mask_tasks.append((f_down, mask_dir_f_down))
-            _resize_image_folder(colmap_image_dir, image_tasks, ext=".jpeg")
-            _resize_image_folder(colmap_mask_dir, mask_tasks, interpolation=cv2.INTER_CUBIC, ext=".png")
-        
-        mask_paths_by_factor = {}
-        image_paths_by_factor = {}
-        for f in range(1, factor+1):
-            suffix = "" if f == 1 else f"_{f}"
-            image_dir_f = os.path.join(os.path.dirname(image_dir), os.path.basename(image_dir) + suffix)
-            mask_dir_f = os.path.join(os.path.dirname(mask_dir), os.path.basename(mask_dir) + suffix)
-            image_files = sorted(_get_rel_paths(image_dir_f))
-            mask_files = sorted(_get_rel_paths(mask_dir_f))
-
-            colmap_to_image = dict(zip(colmap_files, image_files))
-            image_paths_by_factor[f] = [os.path.join(image_dir_f, colmap_to_image[f]) for f in image_names]
-            colmap_to_image = dict(zip(colmap_files, mask_files))
-            mask_paths_by_factor[f] = [os.path.join(mask_dir_f, colmap_to_image[f]) for f in image_names]
 
         # 3D points and {image_name -> [point_idx]}
         points = manager.points3D.astype(np.float32)
@@ -242,31 +238,11 @@ class Parser:
             T2 = align_principal_axes(points)
             camtoworlds = transform_cameras(T2, camtoworlds)
             points = transform_points(T2, points)
-
             transform = T2 @ T1
-
-            # Fix for up side down. We assume more points towards
-            # the bottom of the scene which is true when ground floor is
-            # present in the images.
-            if np.median(points[:, 2]) > np.mean(points[:, 2]):
-                # rotate 180 degrees around x axis such that z is flipped
-                T3 = np.array(
-                    [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, -1.0, 0.0, 0.0],
-                        [0.0, 0.0, -1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ]
-                )
-                camtoworlds = transform_cameras(T3, camtoworlds)
-                points = transform_points(T3, points)
-                transform = T3 @ transform
         else:
             transform = np.eye(4)
 
         self.image_names = image_names  # List[str], (num_images,)
-        self.image_paths = image_paths_by_factor # Dict[Int,List[str]], (factor, (num_images,))
-        self.mask_paths = mask_paths_by_factor # Dict[Int, List[str]], (factor, (num_images,))
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = {} # Dict of (factor,camera_id) -> K
@@ -283,11 +259,15 @@ class Parser:
         self.mapx_dict = dict() # (factor, camera_id) -> mapx
         self.mapy_dict = dict() # (factor, camera_id) -> mapy
         self.roi_undist_dict = dict() # (factor, camera_id) -> roi
+        
+        assert len(self.params_dict) == 1, "allow only one camera id"
 
         # load one image per factor to fill the intrinsics, sizes and generate undistort maps etc.
         for f in range(1, factor+1):
-            actual_image = imageio.imread(self.image_paths[f][0])[..., :3]
+            actual_image = cv2.imread(os.path.join(image_dir, image_files[0]))[..., :3]
             actual_height, actual_width = actual_image.shape[:2]
+            actual_height = actual_height//f
+            actual_width = actual_width//f
             colmap_width, colmap_height = camera_imsize_dict[self.camera_ids[0]]
             s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
             for camera_id, K_original in camera_Ks_dict.items():
@@ -301,7 +281,7 @@ class Parser:
             for camera_id in self.params_dict.keys():
                 params = self.params_dict[camera_id]
                 if len(params) == 0:
-                    continue  # no distortion
+                    params = np.array([0.0,0.0,0.0,0.0, 0.0]).astype(np.float32)
                 assert camera_id in camera_Ks_dict, f"Missing K for camera {camera_id}"
                 assert (
                     camera_id in self.params_dict
@@ -360,7 +340,39 @@ class Parser:
                 self.Ks_dict[(f,camera_id)] = K_undist
                 self.imsize_dict[(f,camera_id)] = (actual_width, actual_height)
                 self.mask_dict[(f,camera_id)] = mask
+                
+                
+        mask_tasks = []
+        image_tasks = []
+        for f_down in range(1,factor+1):
+            image_dir_f_down = os.path.join(os.path.dirname(image_dir), os.path.basename(image_dir) + f"_undist_{f_down}")
+            mask_dir_f_down = os.path.join(os.path.dirname(mask_dir), os.path.basename(mask_dir) + f"_undist_{f_down}")
+            image_tasks.append((f_down, image_dir_f_down))
+            mask_tasks.append((f_down, mask_dir_f_down))
+        _undistort_image_folder(colmap_image_dir, image_tasks, self.mapx_dict, self.mapy_dict, ext=".jpeg")
+        _undistort_image_folder(colmap_mask_dir, mask_tasks, self.mapx_dict, self.mapy_dict, interpolation=cv2.INTER_CUBIC, ext=".png")
+        
+        mask_paths_by_factor = {}
+        image_paths_by_factor = {}
+        for f in range(1, factor+1):
+            suffix = f"_undist_{f}"
+            image_dir_f = os.path.join(os.path.dirname(image_dir), os.path.basename(image_dir) + suffix)
+            mask_dir_f = os.path.join(os.path.dirname(mask_dir), os.path.basename(mask_dir) + suffix)
+            image_files = sorted(_get_rel_paths(image_dir_f))
+            mask_files = sorted(_get_rel_paths(mask_dir_f))
 
+            colmap_to_image = dict(zip(colmap_files, image_files))
+            image_paths_by_factor[f] = [os.path.join(image_dir_f, colmap_to_image[f]) for f in image_names]
+            colmap_to_image = dict(zip(colmap_files, mask_files))
+            mask_paths_by_factor[f] = [os.path.join(mask_dir_f, colmap_to_image[f]) for f in image_names]
+        
+        self.image_paths = image_paths_by_factor # Dict[Int,List[str]], (factor, (num_images,))
+        self.mask_paths = mask_paths_by_factor # Dict[Int, List[str]], (factor, (num_images,))
+        self.is_undistorted = True
+                
+
+        np.save(os.path.join(data_dir, "map_x.npy"),self.mapx_dict,allow_pickle=True)
+        np.save(os.path.join(data_dir, "map_y.npy"),self.mapy_dict,allow_pickle=True)
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
@@ -416,7 +428,7 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[(factor,camera_id)]
         
-        load_factor = 1 if len(params) > 0 else factor
+        load_factor = 1 if len(params) > 0 and not self.parser.is_undistorted else factor
 
         image = cv2.imread(self.parser.image_paths[load_factor][index], cv2.IMREAD_UNCHANGED)
         image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -428,14 +440,11 @@ class Dataset:
             opened = cv2.morphologyEx(eroded, cv2.MORPH_OPEN, kernel)
             fgmask = (fgmask*(opened>0)).squeeze()
             """
- 
- 
- 
         else: fgmask = np.ones((image.shape[0], image.shape[1]), dtype=np.uint8)
         
         
 
-        if len(params) > 0:
+        if not self.parser.is_undistorted:
             # Images are distorted. Undistort them.
             mapx, mapy = (
                 self.parser.mapx_dict[(factor,camera_id)],

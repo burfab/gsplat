@@ -94,8 +94,8 @@ class GsplatViewer(Viewer):
                         self.render_tab_state.near_plane,
                         self.render_tab_state.far_plane,
                     ),
-                    min=(1e-3, 1e1),
-                    max=(1e1, 1e3),
+                    min=(1e-3, 1e2),
+                    max=(1e-2, 1e3),
                     step=1e-3,
                     hint="Near and far plane for rendering.",
                 )
@@ -150,7 +150,7 @@ class GsplatViewer(Viewer):
                 if self.rasterizer == "2dgs":
                     render_mode_dropdown = server.gui.add_dropdown(
                         "Render Mode",
-                        ("rgb", "depth(median)", "depth(accumulated)", "depth(expected)", "normal", "alpha", "dist"),
+                        ("rgb", "depth(median)", "depth(accumulated)", "depth(expected)", "normal", "normal(depth)", "alpha", "dist"),
                         initial_value=self.render_tab_state.render_mode,
                         hint="Render mode to use.",
                     )

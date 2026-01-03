@@ -132,7 +132,7 @@ class DefaultStrategy(Strategy):
 
         super().check_sanity(params, optimizers)
         # The following keys are required for this strategy.
-        for key in ["means", "scales", "quats", "opacities"]:
+        for key in ["means", "scales", "opacities"]:
             assert key in params, f"{key} is required in params but missing."
 
     def step_pre_backward(

@@ -69,13 +69,14 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
     rasterizer: Literal ["2dgs", "3dgs"] = "2dgs"
+    isotropic: bool = True
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
     # increase data factor at these iterations until we are at 1
-    data_factor_up_steps = [9_000, 25_000]
+    data_factor_up_steps = [19_000, 24_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -96,11 +97,16 @@ class Config:
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
+    
+    alpha_start_iter: int = 500
+    #alpha regularization (= datafidel + tv_lambda * tv)
+    alpha_lambda = 1.0
+    alpha_tv_lambda = 1.0
 
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [70_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [9_999, 30_000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
@@ -140,7 +146,7 @@ class Config:
     # Enable normal consistency loss. (Currently for 2DGS only)
     normal_loss: bool = True
     # Weight for normal loss
-    normal_lambda: float = 5e-2
+    normal_lambda: float = 1e-2
     # Iteration to start normal consistency regulerization
     normal_start_iter: int = 7_000
 
@@ -250,6 +256,7 @@ class Config:
 
 def create_splats_with_optimizers(
     parser: Parser,
+    cfg,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -283,7 +290,8 @@ def create_splats_with_optimizers(
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
     dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    scales = torch.log(dist_avg * init_scale).unsqueeze(-1)
+    if not cfg.isotropic: scales = scales.repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
@@ -291,16 +299,20 @@ def create_splats_with_optimizers(
     scales = scales[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
+    if not cfg.isotropic or cfg.rasterizer == "2dgs":
+        quats = torch.rand((N, 4))  # [N, 4]
+    else:
+        quats = None
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
         ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
         ("opacities", torch.nn.Parameter(opacities), opacities_lr),
     ]
+    if not quats is None:
+        params.append(("quats", torch.nn.Parameter(quats), quats_lr))
 
     if feature_dim is None:
         # color is SH coefficients.
@@ -496,7 +508,7 @@ def stereo_depth_from_disparity(disp, Q):
 class Runner:
     def tsdf_mesh(self, step, tsdf_im_freq = 10, verbose=True):
         if verbose: print("TSDF Integration")
-        tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/256, 2.0,16)
+        tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/128, 2.0,16)
         tsdf = TSDF(tsdf_args)
         tsdf.create()
         with torch.no_grad():
@@ -540,7 +552,7 @@ class Runner:
                 renderer.create()
                 renderer.add_geometry(mesh)
             
-            rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w), None, None)
+            rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w),True,None,None)
             
             stereo_depth_file = os.path.join(directory, f"{index}_stereo_depth.pth")
             stereo_depth_feats_file = os.path.join(directory, f"{index}_stereo_depth_feats.pth")
@@ -619,6 +631,7 @@ class Runner:
         feature_dim = 32 if cfg.app_opt else None
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
+            self.cfg,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
@@ -732,8 +745,9 @@ class Runner:
         def maskedPSNR(x,y,mask, max_ = 1.0):
             if mask is None:
                 mask = torch.ones_like(x).float()
-            l2 = ((x-y)*mask.permute(0,3,1,2).repeat(1,3,1,1))**2
-            mse = l2.sum() / (mask.sum()+1e-6)
+            mask = mask.squeeze().expand_as(x)
+            l2 = ((x-y)*mask)**2
+            mse = l2.sum() / ((mask.sum()+1e-6) * (x.numel() / mask.numel()))
             psnr = 10 * torch.log10((max_**2)/mse)
             return psnr
 
@@ -777,8 +791,14 @@ class Runner:
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
+        if "quats" in self.splats:
+            quats = self.splats["quats"]  
+        else:
+            quats = torch.zeros((means.shape[0], 4), device=means.device, dtype=means.dtype)
+            quats[:, 0] = 1.0  # w = 1 
+        scales = torch.exp(self.splats["scales"])
+        if cfg.isotropic:
+            scales = scales.repeat((1,3))  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
@@ -986,15 +1006,27 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         stereo_depth_maps = {}
         update_tsdf_mesh = False
+        update_stereo_maps = False
+        tsdf_mesh = None
+        depth_eps = 0.0
         for step in pbar:
             update_tsdf_mesh = update_tsdf_mesh or \
                 ((step-self.cfg.self_supervised_depth_step_start) % self.cfg.self_supervised_depth_refresh_every == 0)
-            update_tsdf_mesh = self.cfg.self_supervised_depth_step_start <= step and update_tsdf_mesh
+            update_tsdf_mesh = self.cfg.self_supervised_depth_step_start <= step \
+                and update_tsdf_mesh
+            update_stereo_maps = self.cfg.self_supervised_depth_step_start <= step and update_stereo_maps
+            if update_stereo_maps and tsdf_mesh is None: update_tsdf_mesh = True
+            
             if update_tsdf_mesh:
-                mesh = self.tsdf_mesh(step, cfg.tsdf_im_freq)
-                o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", mesh)
-                stereo_depth_maps = self.render_mesh_to_depth(mesh, step)
+                tsdf_mesh = self.tsdf_mesh(step, cfg.tsdf_im_freq)
+                o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", tsdf_mesh)
+                update_stereo_maps = True 
                 update_tsdf_mesh = False
+                #mesh = o3d.io.read_triangle_mesh(f"/tmp/mesh_tsdf_10000.ply")
+            if update_stereo_maps:
+                stereo_depth_maps = self.render_mesh_to_depth(tsdf_mesh, step)
+                update_stereo_maps = False
+                depth_eps = (tsdf_mesh.get_max_bound()-tsdf_mesh.get_min_bound()).max() * 0.025
             
             
             if not cfg.disable_viewer:
@@ -1018,15 +1050,12 @@ class Runner:
 
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
-            fgmask = data["fgmask"].to(device).float()
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device).float() if "mask" in data else None  # [1, H, W]
-
-            total_mask = (masks * fgmask) if masks is not None else fgmask
-
+            
             assert len(image_ids) == 1
             stereo_depth_file, stereo_depth_step = (None,-1) if not image_ids.item() in stereo_depth_maps else stereo_depth_maps[image_ids.item()]
             if not stereo_depth_file is None: 
@@ -1035,6 +1064,13 @@ class Runner:
                 if len(stereo_depth.shape) == 2: stereo_depth = stereo_depth.unsqueeze(0)
                 if len(stereo_depth.shape) == 3: stereo_depth = stereo_depth.unsqueeze(-1)
             else: stereo_depth = None
+            
+            if stereo_depth is not None and False:
+                fgmask = (stereo_depth > 0).float()
+            else: fgmask = data["fgmask"].to(device).float()
+
+            total_mask = (masks * fgmask) if masks is not None else fgmask
+
             
             valid_px = total_mask.sum()
             all_px   = total_mask.numel()
@@ -1074,6 +1110,8 @@ class Runner:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
+            if cfg.rasterizer == "2dgs":
+                depths = render_median
                 
             
 
@@ -1104,6 +1142,9 @@ class Runner:
                 info=info,
             )
             
+            
+            
+            
             #pixels = pixels * total_mask
             #colors = colors * total_mask
 
@@ -1115,19 +1156,14 @@ class Runner:
                 pixels.permute(0,3,1,2)
             )) 
 
+
             stereo_depth_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
             if stereo_depth is not None:
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
                 mask_valid_depth = (stereo_depth > 0)# & (depths_squeezed > 0)
-                
-                disp_gt = torch.where(mask_valid_depth, 1.0 / stereo_depth, torch.zeros_like(stereo_depth))
-                
-                sum_valid = mask_valid_depth.sum().item()
-                if sum_valid > 0:
-                    #diff_depth = (stereo_depth[mask_valid_depth] - depths_squeezed[mask_valid_depth])
-                    #stereo_depth_loss = F.l1_loss(stereo_depth[mask_valid_depth], depths_squeezed[mask_valid_depth])
-                    stereo_depth_loss = F.l1_loss(disp, disp_gt)
-
+                #disp_gt = torch.where(mask_valid_depth, 1.0 / stereo_depth, torch.zeros_like(stereo_depth))
+                #disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                depth_diff = (depths[mask_valid_depth] - stereo_depth[mask_valid_depth]).abs()-depth_eps
+                stereo_depth_loss = F.relu(depth_diff).mean()
 
             
             normal_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
@@ -1161,10 +1197,14 @@ class Runner:
 
             dfloss_alpha =  alpha_energy_loss(alphas, fgmask, foreground_loss=False, norm="l1")
             tvloss_alpha = tv_loss_masked(alphas, fgmask, norm="l2")
-            alpha_reg = lamda_tv_t(1, 1e-1, step, max_steps, 500) * (dfloss_alpha + tvloss_alpha) #/ den_bg
+            if step > cfg.alpha_start_iter:
+                alpha_lambda = cfg.alpha_lambda
+            else:
+                alpha_lambda = 0.0
+            alpha_reg = (dfloss_alpha + cfg.alpha_tv_lambda * tvloss_alpha) #/ den_bg
 
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + \
-                alpha_reg + \
+                alpha_lambda * alpha_reg + \
                 cfg.depth_lambda * self.scene_scale * stereo_depth_loss + \
                     normal_lambda * normal_loss + dist_lambda * dist_loss
 
@@ -1272,8 +1312,13 @@ class Runner:
                     shN = self.splats["shN"]
 
                 means = self.splats["means"]
-                scales = self.splats["scales"]
-                quats = self.splats["quats"]
+                scales = self.splats["scales"].expand((-1,3))
+                if "quats" in self.splats:
+                    quats = self.splats["quats"]
+                else:
+                    quats = torch.zeros((means.shape[0], 4), device=means.device, dtype=means.dtype)
+                    quats[:, 0] = 1.0  # w = 1
+                    
                 opacities = self.splats["opacities"]
                 export_splats(
                     means=means,
@@ -1364,7 +1409,7 @@ class Runner:
             
             if step in [i-1 for i in cfg.data_factor_up_steps]:
                 self.shared_factor.value = max(self.shared_factor.value-1, 1)
-                self.update_tsdf_mesh = True
+                update_stereo_maps = True
 
 
             if not cfg.disable_viewer:
@@ -1409,12 +1454,11 @@ class Runner:
             if "mask" in data:
                 mask = fgmask * data["mask"][...,None].to(device).bool()
             else: mask = fgmask
-            loss_scale_factor = 1/((mask.sum()) / np.prod(mask.shape) + 1e-8)
 
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _, _, _, _, _ = self.rasterize_splats(
+            colors, alphas, _, _, _, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1434,6 +1478,7 @@ class Runner:
                 # write images
                 canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
+                canvas = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.jpeg",
                     canvas,
@@ -1444,7 +1489,11 @@ class Runner:
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p, fgmask))
+                alphas2 = alphas.detach().clone()
+                alphas2[alphas < 0.8] = 0
+                alphas2 = alphas2.squeeze()
+                metrics["psnr"].append(self.psnr(colors_p, pixels_p, mask))
+                metrics["psnr_alpha_mask"].append(self.psnr(colors_p, pixels_p, alphas2))
                 metrics["ssim"].append(fused_ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
                 if self.cfg.use_bilateral_grid:
@@ -1473,7 +1522,7 @@ class Runner:
                 )
             else:
                 print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
+                    f"PSNR: {stats['psnr']:.3f}, PSNR Alpha: {stats['psnr_alpha_mask']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
                     f"Time: {stats['ellipse_time']:.3f}s/image "
                     f"Number of GS: {stats['num_GS']}"
                 )
@@ -1599,6 +1648,7 @@ class Runner:
             "depth(median)": "RGB+ED",
             "dist": "RGB+ED",
             "normal": "RGB+ED",
+            "normal(depth)": "RGB+ED",
             "alpha": "RGB",
         }
 
@@ -1653,9 +1703,10 @@ class Runner:
                 .cpu()
                 .numpy()
             )
-        elif render_tab_state.render_mode == "normal":
-            render_normals = render_normals[0,...] * 0.5 + 0.5  # normalize to [0, 1]
-            renders = render_normals.cpu().numpy()
+        elif "normal" in render_tab_state.render_mode:
+            normals = render_normals if render_tab_state.render_mode == "normal" else normals_from_depth
+            normals = normals[0,...] * 0.5 + 0.5  # normalize to [0, 1]
+            renders = normals.cpu().numpy()
         elif render_tab_state.render_mode == "dist":
             dist = render_distort[0,..., 0:1] 
             dist = dist/max(dist.max(),1e-7)

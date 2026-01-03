@@ -14,7 +14,7 @@ from gsplat.distributed import cli
 from gsplat.rendering import rasterization_2dgs
 
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from gsplat_viewer_2dgs import GsplatViewer, GsplatRenderTabState
+from gsplat_viewer_extended import GsplatViewer, GsplatRenderTabState
 
 from datasets.colmap import Dataset, Parser
 
@@ -72,20 +72,16 @@ def main(local_rank: int, world_rank, world_size: int, args):
             far_plane=far_plane,
             radius_clip=0,
             eps2d=eps2d,
-            render_mode="RGB+ED",
+            render_mode="RGB+D",
         )
         return render_colors.squeeze(0), render_alphas.squeeze(0), render_median.squeeze(0)
 
-    def maskedPSNR(x,y,mask, max_ = 1.0):
-        x = x[...,:3]
-        y = y[...,:3]
+    def maskedPSNR(x,y,mask, max_ = 1.0, mask_is_alpha_channel=False):
         if mask is None:
             mask = torch.ones_like(x).float()
-        else:
-            if mask.dim() == 2: mask = mask.unsqueeze(-1)
-            mask = mask.expand(-1,-1,x.shape[-1])
+        mask = mask.expand_as(x)
         l2 = ((x-y)*mask)**2
-        mse = l2.sum()/(mask.sum())
+        mse = l2.sum() / ((mask.sum()+1e-6) * (x.numel() / mask.numel()))
         psnr = 10 * torch.log10((max_**2)/mse)
         return psnr
     
@@ -129,7 +125,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
     os.makedirs(render_path, exist_ok=True)
     os.makedirs(gts_path, exist_ok=True)
     cam_infos = []
-    for i in tqdm(range(len(dataset))):
+    for i in tqdm(range(0,len(dataset),args.render_step)):
         image_id = dataset.indices[i]
         data = dataset[i]
 
@@ -156,10 +152,21 @@ def main(local_rank: int, world_rank, world_size: int, args):
         write_image(gt_pixels, os.path.join(gts_path, f"{name}.png"))
         write_image(mask, os.path.join(gts_path, f'{name}_mask' + ".png"))
 
-
         render_colors, render_alphas, render_median = render_fn(camtoworld, K, width, height)
-        cam_info["psnr"] = maskedPSNR(render_colors, gt_pixels, mask).item()
+        #depth = render_colors[...,3:4].detach()
+        depth = render_median.detach()
+        alphas2 = render_alphas.detach().clone()
+        alphas2[render_alphas < 0.8] = 0
+        depth[render_alphas<0.8] = 0
+        
+        cam_info["psnr"] = maskedPSNR(render_colors[...,:3], gt_pixels, mask.unsqueeze(-1)).item()
+        cam_info["psnr_alpha"] = maskedPSNR(render_colors[...,:3], gt_pixels, alphas2, mask_is_alpha_channel=True).item()
         write_image(render_colors[...,:3], os.path.join(render_path, f'{name}_left' + ".png"))
+        
+        if True:
+            torch.save(depth, os.path.join(render_path, f'{name}_left_depth' + ".pth"))
+            torch.save([camtoworld,K], os.path.join(render_path, f'{name}_left_c2w_K' + ".pth"))
+            
 
         for idx_baseline, baseline in enumerate(baselines):
             c2w_right = get_augmented_c2w(camtoworld, baseline)
@@ -184,13 +191,16 @@ if __name__ == "__main__":
         "--test_every", type=int, default=8, help="Test every nth frame"
     )
     parser.add_argument(
+        "--render_step", type=int, default=8, help="Render every nth frame"
+    )
+    parser.add_argument(
         "--dataset_split", type=str, default="train", help="Which dataset split to use. train/val"
     )
     parser.add_argument(
         "--global_scale", type=float, default=1.0, help="Scene scale modifier"
     )
     parser.add_argument(
-        "--baselines_relative", type=list, default=[0.05, 0.1, 0.2], help="Baseline relative to scene scale"
+        "--baselines_relative", type=list, default=[0.07], help="Baseline relative to scene scale"
     )
     parser.add_argument(
         "--data_dir", type=str, default=".", help="dataset input directory"

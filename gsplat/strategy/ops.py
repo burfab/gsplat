@@ -146,12 +146,15 @@ def split(
     rest = torch.where(~mask)[0]
 
     scales = torch.exp(params["scales"][sel])
-    quats = F.normalize(params["quats"][sel], dim=-1)
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    if "quats" in params:
+        quats = F.normalize(params["quats"][sel], dim=-1)
+        rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
+    else:
+        rotmats = torch.eye(3, dtype=scales.dtype, device=scales.device).unsqueeze(0).expand((scales.shape[0], -1,-1))
     samples = torch.einsum(
         "nij,nj,bnj->bni",
         rotmats,
-        scales,
+        scales.expand((-1,3)),
         torch.randn(2, len(scales), 3, device=device),
     )  # [2, N, 3]
 
@@ -279,6 +282,9 @@ def relocate(
         ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,
         binoms=binoms,
     )
+    
+    
+    
     new_opacities = torch.clamp(new_opacities, max=1.0 - eps, min=min_opacity)
 
     def param_fn(name: str, p: Tensor) -> Tensor:
@@ -354,8 +360,8 @@ def inject_noise_to_position(
     opacities = torch.sigmoid(params["opacities"].flatten())
     scales = torch.exp(params["scales"])
     covars, _ = quat_scale_to_covar_preci(
-        params["quats"],
-        scales,
+        params["quats"] if "quats" in params else torch.tensor([[1.0,0.0,0.0,0.0]],dtype=scales.dtype, device=scales.device).expand((scales.shape[0],-1)),
+        scales.expand((-1,3)),
         compute_covar=True,
         compute_preci=False,
         triu=False,

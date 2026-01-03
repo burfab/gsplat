@@ -35,8 +35,9 @@ class HeadlessRenderer:
 
     def render(self, K: np.ndarray,          # 3x3 intrinsics
         T_wc: np.ndarray,       # 4x4 camera-to-world OR world-to-camera (see below)
-        out_color_path="color.png",
-        out_depth_u16_path="depth_mm_u16.png"):
+        z_in_view_space: bool = True,
+        out_color_path=None,
+        out_depth_u16_path=None):
         self.renderer.setup_camera(K, T_wc, self.width, self.height)
 
         color_o3d = self.renderer.render_to_image()
@@ -44,7 +45,7 @@ class HeadlessRenderer:
         if not out_color_path is None and len(out_color_path) > 0:
             o3d.io.write_image(out_color_path, color_o3d)
 
-        depth_o3d = self.renderer.render_to_depth_image(z_in_view_space=True)
+        depth_o3d = self.renderer.render_to_depth_image(z_in_view_space=z_in_view_space)
         depth = np.asarray(depth_o3d).astype(np.float32)
         depth[~np.isfinite(depth)] = 0
         

@@ -36,14 +36,16 @@ def compute_relocation(
 
     N = opacities.shape[0]
     n_max, _ = binoms.shape
-    assert scales.shape == (N, 3), scales.shape
+    isotropic = scales.shape[1] == 1
+    assert scales.shape == (N, 3) or scales.shape == (N,1), scales.shape
     assert ratios.shape == (N,), ratios.shape
     opacities = opacities.contiguous()
-    scales = scales.contiguous()
+    scales = scales
     ratios.clamp_(min=1, max=n_max)
     ratios = ratios.int().contiguous()
 
     new_opacities, new_scales = _make_lazy_cuda_func("relocation")(
-        opacities, scales, ratios, binoms, n_max
+        opacities, scales.expand((-1,3)).contiguous(), ratios, binoms, n_max
     )
+    if isotropic: new_scales = new_scales.max(dim=1,keepdim=True).values
     return new_opacities, new_scales
