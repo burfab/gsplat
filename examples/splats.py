@@ -26,6 +26,10 @@ import pytorch3d.ops
 
 
 class Splats(nn.Module):
+    def __init__(self):
+        self.params_dict = nn.ParameterDict({})
+        self._params_frozen = False
+        
     def fn_opacities_activation(self,x): return torch.sigmoid(x)
     def fn_opacities_inverse_activation(self,x): return torch.logit(x)
     def fn_scales_activation(self,x): return torch.exp(x)
@@ -33,6 +37,11 @@ class Splats(nn.Module):
     
     def type_str(self) -> str:
         pass
+    
+    def freeze_params(self, val: bool):
+        for name, param in self.params_dict.items():
+            param.requires_grad = not val 
+        self._params_frozen = val
     
     def prepare_render(self):
         pass
@@ -382,7 +391,6 @@ class SurfaceSplats(Splats):
         self.schedulers = {}
         self.optimizers = {}
         
-        self._geometry_frozen = False
         
         self.register_buffer("tri_ids", tri_ids.to(device))               # (N,)
         self.register_buffer("triangles", triangles.to(device))               # (N,)
@@ -744,30 +752,16 @@ class SurfaceSplats(Splats):
         pass
     
     def pre_optimizers_step(self, step):
-        if self._geometry_frozen:
-            if self.vertices.grad is not None: self.vertices.grad.zero_() 
-        else:
-            if self.vertices.grad is not None: 
-                torch.nn.utils.clip_grad_norm_(
-                                [self.vertices], 1#self.edge_len_guideline
-                            )
+        if self.vertices.grad is not None: 
+            torch.nn.utils.clip_grad_norm_(
+                            [self.vertices], 1#self.edge_len_guideline
+                        )
             
     def post_optimizers_step(self, step):
         for key in self.schedulers: 
-            if self._geometry_frozen and key == "vertices": continue
             self.schedulers[key].step()
             
 
-    def fix_geometry(self, val: bool):
-        if val == self._geometry_frozen: return
-        opt = self.optimizers["vertices"]
-
-        if val:
-            self._geometry_frozen = True
-            opt.param_groups[0]["lr"] = 0.0
-        else:
-            self._geometry_frozen = False
-            opt.param_groups[0]["lr"] = self.initial_learning_rates["vertices"]
             
     def save_mesh(self, directory = "/tmp/"):
         torch.save(self.triangles, os.path.join(directory, "triangles.pyt"));

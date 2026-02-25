@@ -32,6 +32,8 @@ from datasets.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
+from ppisp.report import export_ppisp_report
+from ppisp import PPISP, PPISPConfig
 from fused_ssim import fused_ssim
 import pytorch3d.io
 import pytorch3d.ops
@@ -68,15 +70,17 @@ class Config:
     compression: Optional[Literal["png"]] = None
     # Render trajectory path
     render_traj_path: str = "interp"
-    rasterizer: Literal ["2dgs", "3dgs"] = "2dgs"
+    rasterizer: Literal ["2dgs", "3dgs"] = "3dgs"
     isotropic: bool = True
-
+    ppisp: bool = True
+    ppisp_step0 = 2_000
+    ppisp_controller_activation_ratio = 20000/30000
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
     # increase data factor at these iterations until we are at 1
-    data_factor_up_steps = [19_000, 24_000]
+    data_factor_up_steps = [5_000, 90_000]
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -100,7 +104,7 @@ class Config:
     
     alpha_start_iter: int = 500
     #alpha regularization (= datafidel + tv_lambda * tv)
-    alpha_lambda = 1.0
+    alpha_lambda = 1.00
     alpha_tv_lambda = 1.0
 
     # Number of training steps
@@ -112,7 +116,7 @@ class Config:
     # Whether to save ply file (storage size can be large)
     save_ply: bool = True
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 10_000, 30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = True
 
@@ -133,8 +137,9 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
     #how many images to skip when taking stereo pairs for tsdf integration
-    tsdf_im_freq:int=10
+    tsdf_im_cnt_max:int=50
     #when to start depth map supervision and computation
+    self_supervised_depth_loss = False
     self_supervised_depth_step_start = 10_000
     #when to refresh depth map
     self_supervised_depth_refresh_every = 5_000
@@ -171,7 +176,7 @@ class Config:
     antialiased: bool = False
 
     # Use random background for training to discourage transparency
-    random_bkgd: bool = True
+    random_bkgd: bool = False
 
     # LR for 3D point positions
     means_lr: float = 1.6e-4
@@ -192,7 +197,7 @@ class Config:
     scale_reg: float = 0.0
 
     # Enable camera optimization.
-    pose_opt: bool = True
+    pose_opt: bool = False
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -252,6 +257,8 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+        strategy.refine_stop_iter = min(strategy.refine_stop_iter, 
+            int(self.max_steps * self.ppisp_controller_activation_ratio))
 
 
 def create_splats_with_optimizers(
@@ -397,11 +404,13 @@ def tv_loss_sobel(img, norm='l1',epsilon=1e-3, reduction='mean'):
     else:
         return tv
     
-def alpha_energy_loss(alpha, fgmask, foreground_loss=False, norm = "l1",reduction='mean'):
+def alpha_energy_loss(alpha, fgmask, foreground_loss=False, norm = "l1",reduction='true_mean'):
+    assert alpha.shape[0] == 1
     # Penalize spurious alpha in background
     reduce = {
-        "mean": lambda x: torch.mean(x),
-        "sum": lambda x: torch.sum(x),
+        "mean": lambda x, mask: torch.mean(x),
+        "true_mean": lambda x, mask: x.sum()/(torch.sum(mask)+1e-6),
+        "sum": lambda x, mask: torch.sum(x),
     }
     norms = {
         "l1": lambda x: torch.abs(x),
@@ -411,15 +420,19 @@ def alpha_energy_loss(alpha, fgmask, foreground_loss=False, norm = "l1",reductio
     assert reduction in reduce, f"reduction not in {reduce.keys()}"
     
     if foreground_loss:
-        return reduce[reduction](norms[norm](alpha - fgmask) * fgmask)
+        return reduce[reduction](norms[norm](
+            torch.nn.functional.relu(fgmask-alpha)
+            ) * fgmask, fgmask)
     else: 
         bgmask = (1.0-fgmask)
-        return reduce[reduction](norms[norm](((1.0-alpha) - bgmask) * bgmask))
+        return reduce[reduction](norms[norm](((1.0-alpha) - bgmask) * bgmask), bgmask)
 
-def tv_loss_masked(alpha, fgmask, norm="l2",reduction = 'mean'):
+def tv_loss_masked(alpha, fgmask, norm="l2",reduction = 'true_mean'):
+    assert alpha.shape[0] == 1
     reduce = {
-        "mean": lambda x: torch.mean(x),
-        "sum": lambda x: torch.sum(x),
+        "mean": lambda x, mask: torch.mean(x),
+        "true_mean": lambda x, mask: x.sum()/(torch.sum(mask)+1e-6),
+        "sum": lambda x, mask: torch.sum(x),
     }
     norms = {
         "l1": lambda x: torch.abs(x),
@@ -435,8 +448,8 @@ def tv_loss_masked(alpha, fgmask, norm="l2",reduction = 'mean'):
     mask_x = fgmask[:, :, 1:, :] * fgmask[:, :, :-1,:]
     mask_y = fgmask[:, 1:, :, :] * fgmask[:, :-1, :,:]
 
-    tv_x = reduce[reduction](norms[norm](dx) * mask_x) #/ (mask_x.sum() + 1e-8)
-    tv_y = reduce[reduction](norms[norm](dy) * mask_y) #/ (mask_y.sum() + 1e-8)
+    tv_x = reduce[reduction](norms[norm](dx) * mask_x, mask_x) #/ (mask_x.sum() + 1e-8)
+    tv_y = reduce[reduction](norms[norm](dy) * mask_y, mask_y) #/ (mask_y.sum() + 1e-8)
     return (tv_x + tv_y)
 
 def lamda_tv_t(lamda0, lamda1, step,max_steps, first_step, last_step = None):
@@ -506,12 +519,13 @@ def stereo_depth_from_disparity(disp, Q):
 #END STEREO PART
 
 class Runner:
-    def tsdf_mesh(self, step, tsdf_im_freq = 10, verbose=True):
+    def tsdf_mesh(self, step, tsdf_im_cnt_max= 10, verbose=True):
         if verbose: print("TSDF Integration")
         tsdf_args = TSDFArgs(5*self.scene_scale,1.0,1/128, 2.0,16)
         tsdf = TSDF(tsdf_args)
         tsdf.create()
         with torch.no_grad():
+            tsdf_im_freq = len(self.trainset) // min(len(self.trainset), tsdf_im_cnt_max)
             for item in tqdm.tqdm(range(0,len(self.trainset),tsdf_im_freq)):
                 index = self.trainset.indices[item]
                 cam_id = self.trainset.parser.camera_ids[index]
@@ -543,7 +557,34 @@ class Runner:
             cam_id = self.trainset.parser.camera_ids[index]
             width,height = self.trainset.parser.imsize_dict[(self.shared_factor.value, cam_id)]
             c2w = self.trainset.parser.camtoworlds[index].astype(np.float32)
+            
+            torch.cuda.synchronize()
             K = self.trainset.parser.Ks_dict[(self.shared_factor.value, cam_id)].astype(np.float32)
+            
+            left_image, alpha_left, _, _, _, _, _ = self.rasterize_splats(
+                camtoworlds=torch.from_numpy(c2w).unsqueeze(0).cuda(),
+                Ks=torch.from_numpy(K).unsqueeze(0).cuda(),
+                width=width,
+                height=height,
+                sh_degree=self.cfg.sh_degree,
+                near_plane=self.cfg.near_plane,
+                far_plane=self.cfg.far_plane,
+                #masks=masks,
+            )
+            grid_y, grid_x = torch.meshgrid(
+            (torch.arange(height, device=self.device) + 0.5) / height,
+            (torch.arange(width, device=self.device) + 0.5) / width,
+            indexing="ij",)
+            grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+        
+            if cfg.ppisp:
+                left_image[...,0:3] = self.ppisp(left_image[...,0:3], grid_xy.expand(left_image.shape[0], -1, -1, -1), resolution=(width, height), camera_idx=0, frame_idx=-1)
+            
+            
+            torch.cuda.synchronize()
+            feats = (left_image.clone().squeeze().clamp(0,1).detach().cpu().numpy() * 255).astype(np.uint8)
+            alpha_left = alpha_left.squeeze(-1).unsqueeze(0)
+            
             
             if renderer.width != width or renderer.height != height:
                 renderer.destroy()
@@ -552,14 +593,15 @@ class Runner:
                 renderer.create()
                 renderer.add_geometry(mesh)
             
-            rendered_color, rendered_depth = renderer.render(K,np.linalg.inv(c2w),True,None,None)
+            _, rendered_depth = renderer.render(K,np.linalg.inv(c2w),True,None,None)
             
             stereo_depth_file = os.path.join(directory, f"{index}_stereo_depth.pth")
-            stereo_depth_feats_file = os.path.join(directory, f"{index}_stereo_depth_feats.pth")
+            stereo_depth_feats_file = os.path.join(directory, f"{index}_stereo_depth_feats.png")
             stereo_depth_transform_file = os.path.join(directory, f"{index}_stereo_depth_transform.pth")
             torch.save(torch.from_numpy(rendered_depth), stereo_depth_file)
             torch.save([torch.from_numpy(c2w),torch.from_numpy(K)], stereo_depth_transform_file)
-            if save_color: torch.save(torch.from_numpy(rendered_color), stereo_depth_feats_file)
+            feats = cv2.cvtColor(feats, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(stereo_depth_feats_file, feats)
             stereo_depth_maps[index] = (stereo_depth_file, step)
         
         renderer.destroy()
@@ -571,6 +613,8 @@ class Runner:
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
+        
+        self._gaussians_frozen = False
         
         
         if True:
@@ -740,6 +784,22 @@ class Runner:
                     eps=1e-15,
                 ),
             ]
+        
+        self.ppisp_optimizers = []
+        self.ppisp_schedulers = []
+        
+        
+ 
+        
+        if cfg.ppisp:
+            ppisp_cfg = PPISPConfig(controller_activation_ratio=cfg.ppisp_controller_activation_ratio, vig_enabled=False)
+            self.ppisp = PPISP(num_cameras=1, num_frames=len(self.trainset), config=ppisp_cfg)
+            # 2. Create optimizers and scheduler
+            self.ppisp_optimizers += self.ppisp.create_optimizers()
+            self.ppisp_schedulers += self.ppisp.create_schedulers(self.ppisp_optimizers, cfg.max_steps)
+        else:
+            self.ppisp = None
+ 
 
         # Losses & Metrics.
         def maskedPSNR(x,y,mask, max_ = 1.0):
@@ -918,6 +978,20 @@ class Runner:
             #masks=masks,
         )
         torch.cuda.synchronize()
+        
+        grid_y, grid_x = torch.meshgrid(
+            (torch.arange(height, device=self.device) + 0.5) / height,
+            (torch.arange(width, device=self.device) + 0.5) / width,
+            indexing="ij",
+        )
+        grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+        
+        if cfg.ppisp:
+            left_image[...,0:3] = self.ppisp(left_image[...,0:3], grid_xy.expand(left_image.shape[0], -1, -1, -1), resolution=(width, height), camera_idx=0, frame_idx=-1)
+            right_image[...,0:3] = self.ppisp(right_image[...,0:3], grid_xy.expand(right_image.shape[0], -1, -1, -1), resolution=(width, height), camera_idx=0, frame_idx=-1)
+        
+        
+        
         feats = left_image.clone().permute((0,3,1,2)).clamp(0,1)
         alpha_left = alpha_left.squeeze(-1).unsqueeze(0)
         left_image = left_image[0].clamp(0,1) * 255; right_image = right_image[0].clamp(0,1) * 255;
@@ -945,6 +1019,22 @@ class Runner:
                                                                                 depth_trunc=float(max_depth/depth_scale),
                                                                                 convert_rgb_to_intensity=False) 
         return rgbd_image
+    
+    def freeze_gaussians(self):
+        """Freeze all Gaussian parameters for controller distillation.
+
+        This prevents Gaussians from being updated by any loss (including regularization)
+        while the controller learns to predict per-frame corrections.
+        """
+        if self._gaussians_frozen:
+            return
+
+        for name, param in self.splats.items():
+            param.requires_grad = False
+            
+
+        self._gaussians_frozen = True
+        print("[Distillation] Gaussian parameters frozen") 
 
     def train(self):
         cfg = self.cfg
@@ -989,6 +1079,8 @@ class Runner:
                     ]
                 )
             )
+            
+            
 
         train_view_sampler = torch.utils.data.WeightedRandomSampler(self.trainset_view_weights, num_samples=len(self.trainset_view_weights),replacement=True)
         trainloader = torch.utils.data.DataLoader(
@@ -1003,30 +1095,46 @@ class Runner:
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
         stereo_depth_maps = {}
         update_tsdf_mesh = False
         update_stereo_maps = False
         tsdf_mesh = None
         depth_eps = 0.0
+        
+        pbar = tqdm.tqdm(range(init_step, max_steps))
+        
+        
         for step in pbar:
+            if step >= self.ppisp._controller_activation_step: self.freeze_gaussians()
+            
             update_tsdf_mesh = update_tsdf_mesh or \
                 ((step-self.cfg.self_supervised_depth_step_start) % self.cfg.self_supervised_depth_refresh_every == 0)
             update_tsdf_mesh = self.cfg.self_supervised_depth_step_start <= step \
                 and update_tsdf_mesh
+                
+            #don't do it on ppisp controller steps 
+            
             update_stereo_maps = self.cfg.self_supervised_depth_step_start <= step and update_stereo_maps
+            if step >= max_steps: 
+                update_tsdf_mesh = False; update_stereo_maps = False
+            
             if update_stereo_maps and tsdf_mesh is None: update_tsdf_mesh = True
             
-            if update_tsdf_mesh:
-                tsdf_mesh = self.tsdf_mesh(step, cfg.tsdf_im_freq)
-                o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", tsdf_mesh)
-                update_stereo_maps = True 
-                update_tsdf_mesh = False
-                #mesh = o3d.io.read_triangle_mesh(f"/tmp/mesh_tsdf_10000.ply")
-            if update_stereo_maps:
-                stereo_depth_maps = self.render_mesh_to_depth(tsdf_mesh, step)
-                update_stereo_maps = False
-                depth_eps = (tsdf_mesh.get_max_bound()-tsdf_mesh.get_min_bound()).max() * 0.025
+            with torch.no_grad():
+                if update_tsdf_mesh:
+                    tsdf_mesh = self.tsdf_mesh(step, cfg.tsdf_im_cnt_max)
+                    o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{step}.ply", tsdf_mesh)
+                    update_stereo_maps = True 
+                    update_tsdf_mesh = False
+                    mesh_torch = pytorch3d.structures.Meshes(
+                        torch.from_numpy(np.asarray(tsdf_mesh.vertices)[None,...]).float(),
+                        torch.from_numpy(np.asarray(tsdf_mesh.triangles)[None,...])).to(device)
+                    
+                    #mesh = o3d.io.read_triangle_mesh(f"/tmp/mesh_tsdf_10000.ply")
+                if update_stereo_maps:
+                    stereo_depth_maps = self.render_mesh_to_depth(tsdf_mesh, step)
+                    update_stereo_maps = False
+                    depth_eps = (tsdf_mesh.get_max_bound()-tsdf_mesh.get_min_bound()).max() * 0.025
             
             
             if not cfg.disable_viewer:
@@ -1070,6 +1178,7 @@ class Runner:
             else: fgmask = data["fgmask"].to(device).float()
 
             total_mask = (masks * fgmask) if masks is not None else fgmask
+            bgmask_hard = fgmask < 0.1
 
             
             valid_px = total_mask.sum()
@@ -1113,7 +1222,24 @@ class Runner:
             if cfg.rasterizer == "2dgs":
                 depths = render_median
                 
-            
+            pixels[bgmask_hard.expand_as(pixels)] = 0 
+            #colors[bgmask_hard.expand_as(colors)] = 0 
+            if cfg.ppisp and step >= cfg.ppisp_step0:
+                grid_y, grid_x = torch.meshgrid(
+                    (torch.arange(height, device=self.device) + 0.5) / height,
+                    (torch.arange(width, device=self.device) + 0.5) / width,
+                    indexing="ij",
+                )
+                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                
+                colors = self.ppisp(
+                        colors,
+                        grid_xy.expand(colors.shape[0], -1, -1, -1),
+                        resolution=(width, height),
+                        camera_idx=0,
+                        frame_idx=image_ids
+                    )
+ 
 
 
             if cfg.use_bilateral_grid:
@@ -1132,7 +1258,10 @@ class Runner:
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                colors = colors + bkgd * (1.0 - alphas) * fgmask
+                #pixels are already set to black at !fgmask
+                pixels = pixels + bkgd * fgmask
+
 
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
@@ -1150,21 +1279,44 @@ class Runner:
 
             # compute photometric loss only on foreground
             # === photometric on foreground only ===
+            
+            dfloss_alpha = alpha_energy_loss(alphas, fgmask, foreground_loss=False, norm="l1") \
+                + 0.3 * alpha_energy_loss(alphas, fgmask, foreground_loss=True, norm="l2")
+            tvloss_alpha = tv_loss_masked(alphas, fgmask, norm="l2")
+            
+            
+            """
+            dfloss_alpha = (alphas-fgmask).abs().mean()#(alphas * (1.0-fgmask) + (1.0-alphas) * fgmask).mean()
+            tvloss_alpha = tv_loss_masked(alphas, fgmask, norm="l2")
+            """
+            alpha_reg = (dfloss_alpha + cfg.alpha_tv_lambda * tvloss_alpha) #/ den_bg
+            
+            
             l1loss   = F.l1_loss(colors, pixels)
             ssimloss = (1.0 - fused_ssim(
                 colors.permute(0,3,1,2), 
                 pixels.permute(0,3,1,2)
             )) 
 
-
+                
+                
+            if step > cfg.alpha_start_iter:
+                alpha_lambda = cfg.alpha_lambda
+            else:
+                alpha_lambda = 0.0
+                
             stereo_depth_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
-            if stereo_depth is not None:
+            if stereo_depth is not None and cfg.self_supervised_depth_loss:
                 mask_valid_depth = (stereo_depth > 0)# & (depths_squeezed > 0)
                 #disp_gt = torch.where(mask_valid_depth, 1.0 / stereo_depth, torch.zeros_like(stereo_depth))
                 #disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
+                stereo_depth_loss = pytorch3d.loss.chamfer_distance(self.splats["means"][None,...], mesh_torch.verts_packed()[None,...])[0]
+                alpha_lambda = 0
+                """
                 depth_diff = (depths[mask_valid_depth] - stereo_depth[mask_valid_depth]).abs()-depth_eps
                 stereo_depth_loss = F.relu(depth_diff).mean()
-
+                """
+                
             
             normal_loss = torch.tensor(0.0).to(l1loss.device).requires_grad_(True)
             normal_lambda = 0
@@ -1195,13 +1347,6 @@ class Runner:
             
             
 
-            dfloss_alpha =  alpha_energy_loss(alphas, fgmask, foreground_loss=False, norm="l1")
-            tvloss_alpha = tv_loss_masked(alphas, fgmask, norm="l2")
-            if step > cfg.alpha_start_iter:
-                alpha_lambda = cfg.alpha_lambda
-            else:
-                alpha_lambda = 0.0
-            alpha_reg = (dfloss_alpha + cfg.alpha_tv_lambda * tvloss_alpha) #/ den_bg
 
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda + \
                 alpha_lambda * alpha_reg + \
@@ -1211,6 +1356,9 @@ class Runner:
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+                
+            if cfg.ppisp and step > cfg.ppisp_step0:
+               loss += self.ppisp.get_regularization_loss() 
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -1288,6 +1436,8 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.ppisp:
+                    data["ppisp_module"] = self.ppisp.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1357,6 +1507,7 @@ class Runner:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
             # optimize
+            
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
                     optimizer.step(visibility_mask)
@@ -1372,6 +1523,14 @@ class Runner:
             for optimizer in self.bil_grid_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            #ppisp
+            for opt in self.ppisp_optimizers:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            for sched in self.ppisp_schedulers:
+                sched.step()
+    
+                
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1396,7 +1555,7 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
-                
+                    
             
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1425,8 +1584,17 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-        mesh = self.tsdf_mesh(max_steps-1, cfg.tsdf_im_freq)
+        mesh = self.tsdf_mesh(max_steps-1, cfg.tsdf_im_cnt_max)
         o3d.io.write_triangle_mesh(f"/tmp/mesh_tsdf_{max_steps-1}.ply", mesh)
+        
+        
+        
+        pdf_paths = export_ppisp_report(
+            self.ppisp,
+            frames_per_camera=[len(self.trainset)],  # frames per camera
+            output_dir=Path("/tmp/ppisp_reports"),
+        ) 
+            
 
 
     @torch.no_grad()
@@ -1470,6 +1638,7 @@ class Runner:
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
+            
 
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
@@ -1496,6 +1665,20 @@ class Runner:
                 metrics["psnr_alpha_mask"].append(self.psnr(colors_p, pixels_p, alphas2))
                 metrics["ssim"].append(fused_ssim(colors_p, pixels_p))
                 metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                if self.cfg.ppisp:
+                    colors_cc = colors[..., 0:3].clone()
+                    grid_y, grid_x = torch.meshgrid(
+                        (torch.arange(height, device=self.device) + 0.5) / height,
+                        (torch.arange(width, device=self.device) + 0.5) / width,
+                        indexing="ij",
+                    )
+                    grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+                    colors_cc = self.ppisp(colors_cc, grid_xy.expand(colors_cc.shape[0], -1, -1, -1), resolution=(width, height), camera_idx=0, frame_idx=-1) 
+                    colors_cc_p = colors_cc.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    metrics["cc_psnr"].append(self.psnr(colors_cc_p, pixels_p,mask))
+                    metrics["cc_psnr_alpha_mask"].append(self.psnr(colors_cc_p, pixels_p, alphas2))
+                    metrics["cc_ssim"].append(fused_ssim(colors_cc_p, pixels_p))
+                    metrics["cc_lpips"].append(self.lpips(colors_cc_p, pixels_p))
                 if self.cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1513,7 +1696,7 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
-            if self.cfg.use_bilateral_grid:
+            if self.cfg.use_bilateral_grid or self.cfg.ppisp:
                 print(
                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
@@ -1630,6 +1813,7 @@ class Runner:
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
         assert isinstance(render_tab_state, GsplatRenderTabState)
+            
         if render_tab_state.preview_render:
             width = render_tab_state.render_width
             height = render_tab_state.render_height
@@ -1680,8 +1864,19 @@ class Runner:
 
         if render_tab_state.render_mode == "rgb":
             # colors represented with sh are not guranteed to be in [0, 1]
-            render_colors = render_colors[0, ..., 0:3].clamp(0, 1)
-            renders = render_colors.cpu().numpy()
+            render_colors = render_colors[..., 0:3]
+            
+            grid_y, grid_x = torch.meshgrid(
+                (torch.arange(height, device=self.device) + 0.5) / height,
+                (torch.arange(width, device=self.device) + 0.5) / width,
+                indexing="ij",
+            )
+            grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            
+            if cfg.ppisp and not render_tab_state.ppisp_disabled:
+                render_colors = self.ppisp(render_colors, grid_xy.expand(render_colors.shape[0], -1, -1, -1), resolution=(width, height), camera_idx=0, frame_idx=-1)
+            renders = render_colors[0].clamp(0, 1).cpu().numpy()
+ 
         elif "depth" in render_tab_state.render_mode:
             if render_tab_state.render_mode == "depth(median)":
                 depth = render_median[0,...]
@@ -1787,7 +1982,7 @@ if __name__ == "__main__":
                 init_scale=0.1,
                 opacity_reg=0.01,
                 scale_reg=0.05,
-                strategy=MCMCStrategy(verbose=True, cap_max=300_000),
+                strategy=MCMCStrategy(verbose=True, cap_max=120_000),
             ),
         ),
     }

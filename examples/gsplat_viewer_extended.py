@@ -31,6 +31,7 @@ class GsplatRenderTabState(RenderTabState):
     
     scale_mod: float = 1.0
     random_color: bool = False
+    ppisp_disabled: bool = False
 
 
 class GsplatViewer(Viewer):
@@ -225,6 +226,20 @@ class GsplatViewer(Viewer):
                 def _(_) -> None:
                     self.render_tab_state.inverse = inverse_checkbox.value
                     self.rerender(_)
+                    
+                    
+                ppisp_disabled_checkbox = server.gui.add_checkbox(
+                    "PPISP Disabled",
+                    initial_value=self.render_tab_state.ppisp_disabled,
+                    disabled=False,
+                    hint="Disable PPISP",
+                )
+
+                @ppisp_disabled_checkbox.on_update
+                def _(_) -> None:
+                    self.render_tab_state.ppisp_disabled = ppisp_disabled_checkbox.value
+                    self.rerender(_)
+                    
 
                 colormap_dropdown = server.gui.add_dropdown(
                     "Colormap",

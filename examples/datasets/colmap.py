@@ -200,8 +200,11 @@ class Parser:
 
         colmap_image_dir = os.path.join(data_dir, "images")
         colmap_mask_dir = os.path.join(data_dir, "masks_matted")
+        if not os.path.exists(colmap_mask_dir):
+            colmap_mask_dir = os.path.join(data_dir, "masks")
+            
         image_dir = os.path.join(data_dir, "images")
-        mask_dir = os.path.join(data_dir, "masks_matted")
+        mask_dir = colmap_mask_dir
         resize_input = False
         for d in [image_dir, colmap_image_dir, mask_dir, colmap_mask_dir]:
             if not os.path.exists(d):
@@ -464,11 +467,13 @@ class Dataset:
             K[1, 2] -= y
 
         data = {
+            "camera_id": camera_id,
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "fgmask": torch.from_numpy(fgmask).float().unsqueeze(-1)/255,
             "image_id": item,  # the index of the image in the dataset
+            "index": index,  # the index of the image in the dataset
             "factor": factor,
         }
         
